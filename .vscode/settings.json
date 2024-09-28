@@ -1,0 +1,12 @@
+{
+    "files.associations": {
+        "tty.h": "c",
+        "interrupt.h": "c",
+        "stdbool.h": "c",
+        "stdint.h": "c",
+        "io.h": "c",
+        "stdio.h": "c",
+        "stddef.h": "c",
+        "stdlib.h": "c"
+    }
+}
