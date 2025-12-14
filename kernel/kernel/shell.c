@@ -21,6 +21,14 @@ static inline unsigned char vga_entry_color(enum vga_color fg, enum vga_color bg
 
 static unsigned int command_count = 0;
 static unsigned int tick_count = 0;
+static bool timer_running = false;
+static unsigned int timer_start = 0;
+
+// Command history
+#define HISTORY_SIZE 10
+static char history_buffer[HISTORY_SIZE][MAX_COMMAND_LENGTH];
+static int history_count = 0;
+static int history_index = 0;
 
 // Simple pseudo-random number generator
 static unsigned int rand_seed = 12345;
@@ -47,6 +55,16 @@ static void command_memory(const char* args);
 static void command_reverse(const char* args);
 static void command_guess(void);
 static void command_art(void);
+static void command_strlen(const char* args);
+static void command_upper(const char* args);
+static void command_lower(const char* args);
+static void command_rainbow(const char* args);
+static void command_draw(const char* args);
+static void command_timer(const char* args);
+static void command_rps(void);
+static void command_history(void);
+static void command_halt(void);
+static void command_randcolor(void);
 
 static int strcmp_local(const char* s1, const char* s2) {
 	while (*s1 && (*s1 == *s2)) { s1++; s2++; }
@@ -58,6 +76,13 @@ static bool starts_with(const char* str, const char* prefix) {
 		if (*str++ != *prefix++) return false;
 	}
 	return true;
+}
+
+static void strcpy_local(char* dest, const char* src) {
+	while (*src) {
+		*dest++ = *src++;
+	}
+	*dest = '\0';
 }
 
 static int parse_int(const char* str) {
@@ -94,6 +119,19 @@ void shell_init(void) {
 		input_line(command, MAX_COMMAND_LENGTH);
 		if (strlen(command) > 0) {
 			command_count++;
+			
+			// Add to history
+			if (history_count < HISTORY_SIZE) {
+				strcpy_local(history_buffer[history_count], command);
+				history_count++;
+			} else {
+				// Shift history and add new command
+				for (int i = 0; i < HISTORY_SIZE - 1; i++) {
+					strcpy_local(history_buffer[i], history_buffer[i + 1]);
+				}
+				strcpy_local(history_buffer[HISTORY_SIZE - 1], command);
+			}
+			
 			execute_command(command);
 		}
 	}
@@ -124,22 +162,30 @@ static void input_line(char* buffer, size_t max_length) {
 }
 
 static void execute_command(const char* command) {
-	while (*command == ' ') command++;
-	
 	if (strcmp_local(command, "help") == 0) command_help();
 	else if (strcmp_local(command, "clear") == 0) command_clear();
 	else if (strcmp_local(command, "about") == 0) command_about();
+	else if (strcmp_local(command, "banner") == 0) command_banner();
 	else if (strcmp_local(command, "colors") == 0) command_colors();
 	else if (strcmp_local(command, "sysinfo") == 0) command_sysinfo();
-	else if (strcmp_local(command, "banner") == 0) command_banner();
 	else if (strcmp_local(command, "uptime") == 0) command_uptime();
 	else if (strcmp_local(command, "guess") == 0) command_guess();
 	else if (strcmp_local(command, "art") == 0) command_art();
+	else if (strcmp_local(command, "rps") == 0) command_rps();
+	else if (strcmp_local(command, "history") == 0) command_history();
+	else if (strcmp_local(command, "halt") == 0) command_halt();
+	else if (strcmp_local(command, "randcolor") == 0) command_randcolor();
 	else if (starts_with(command, "echo ")) command_echo(command + 5);
 	else if (starts_with(command, "color ")) command_color(command + 6);
 	else if (starts_with(command, "calc ")) command_calc(command + 5);
 	else if (starts_with(command, "mem ")) command_memory(command + 4);
 	else if (starts_with(command, "reverse ")) command_reverse(command + 8);
+	else if (starts_with(command, "strlen ")) command_strlen(command + 7);
+	else if (starts_with(command, "upper ")) command_upper(command + 6);
+	else if (starts_with(command, "lower ")) command_lower(command + 6);
+	else if (starts_with(command, "rainbow ")) command_rainbow(command + 8);
+	else if (starts_with(command, "draw ")) command_draw(command + 5);
+	else if (starts_with(command, "timer ")) command_timer(command + 6);
 	else if (strcmp_local(command, "") != 0) {
 		printf("Unknown command: %s\n", command);
 		printf("Type 'help' for available commands.\n");
@@ -156,12 +202,32 @@ static void command_help(void) {
 	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
 	printf("General Commands:\n");
 	terminal_setcolor(old_color);
-	printf("  help          - Display this help message\n");
-	printf("  clear         - Clear the screen\n");
-	printf("  about         - Display information about this OS\n");
-	printf("  banner        - Display welcome banner\n");
-	printf("  sysinfo       - Display system information\n");
-	printf("  uptime        - Show system uptime\n");
+	printf("  strlen <text> - Show string length\n");
+	printf("  upper <text>  - Convert to uppercase\n");
+	printf("  lower <text>  - Convert to lowercase\n");
+	
+	printf("\n");
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+	printf("Visual Effects:\n");
+	terminal_setcolor(old_color);
+	printf("  rainbow <text> - Display text in rainbow colors\n");
+	printf("  draw <type>   - Draw patterns (box, line, rainbow)\n");
+	printf("  randcolor     - Set random colors\n");
+	
+	printf("\n");
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+	printf("Games:\n");
+	terminal_setcolor(old_color);
+	printf("  guess         - Number guessing game\n");
+	printf("  rps           - Rock Paper Scissors\n");
+	
+	printf("\n");
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+	printf("System:\n");
+	terminal_setcolor(old_color);
+	printf("  timer <start|stop> - Simple timer\n");
+	printf("  history       - Show command history\n");
+	printf("  halt          - Halt the system");
 	
 	printf("\n");
 	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
@@ -611,4 +677,237 @@ static void command_art(void) {
 	
 	terminal_setcolor(old_color);
 	printf("\n");
+}
+
+static void command_strlen(const char* args) {
+	while (*args == ' ') args++;
+	if (!*args) {
+		printf("Usage: strlen <text>\n");
+		return;
+	}
+	
+	int len = 0;
+	const char* ptr = args;
+	while (*ptr++) len++;
+	
+	unsigned char old_color = terminal_getcolor();
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+	printf("String length: %d characters\n", len);
+	terminal_setcolor(old_color);
+}
+
+static void command_upper(const char* args) {
+	while (*args == ' ') args++;
+	if (!*args) {
+		printf("Usage: upper <text>\n");
+		return;
+	}
+	
+	unsigned char old_color = terminal_getcolor();
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+	
+	while (*args) {
+		char c = *args++;
+		if (c >= 'a' && c <= 'z') {
+			printf("%c", c - 32);
+		} else {
+			printf("%c", c);
+		}
+	}
+	printf("\n");
+	terminal_setcolor(old_color);
+}
+
+static void command_lower(const char* args) {
+	while (*args == ' ') args++;
+	if (!*args) {
+		printf("Usage: lower <text>\n");
+		return;
+	}
+	
+	unsigned char old_color = terminal_getcolor();
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_BLUE, VGA_COLOR_BLACK));
+	
+	while (*args) {
+		char c = *args++;
+		if (c >= 'A' && c <= 'Z') {
+			printf("%c", c + 32);
+		} else {
+			printf("%c", c);
+		}
+	}
+	printf("\n");
+	terminal_setcolor(old_color);
+}
+
+static void command_rainbow(const char* args) {
+	while (*args == ' ') args++;
+	if (!*args) {
+		printf("Usage: rainbow <text>\n");
+		return;
+	}
+	
+	unsigned char old_color = terminal_getcolor();
+	int colors[] = {VGA_COLOR_RED, VGA_COLOR_LIGHT_RED, VGA_COLOR_LIGHT_BROWN, 
+	                VGA_COLOR_LIGHT_GREEN, VGA_COLOR_LIGHT_CYAN, VGA_COLOR_LIGHT_BLUE, 
+	                VGA_COLOR_LIGHT_MAGENTA};
+	int color_index = 0;
+	
+	while (*args) {
+		terminal_setcolor(vga_entry_color(colors[color_index % 7], VGA_COLOR_BLACK));
+		printf("%c", *args++);
+		if (*args != ' ') color_index++;
+	}
+	printf("\n");
+	terminal_setcolor(old_color);
+}
+
+static void command_draw(const char* args) {
+	while (*args == ' ') args++;
+	unsigned char old_color = terminal_getcolor();
+	
+	if (strcmp_local(args, "box") == 0) {
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+		printf("\n+--------------------------------------------------+\n");
+		printf("|                                                  |\n");
+		printf("|            MyOS - Operating System               |\n");
+		printf("|                                                  |\n");
+		printf("+--------------------------------------------------+\n\n");
+	} else if (strcmp_local(args, "line") == 0) {
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+		printf("\n================================================\n\n");
+	} else if (strcmp_local(args, "rainbow") == 0) {
+		printf("\n");
+		int colors[] = {VGA_COLOR_RED, VGA_COLOR_LIGHT_RED, VGA_COLOR_LIGHT_BROWN, 
+		                VGA_COLOR_LIGHT_GREEN, VGA_COLOR_LIGHT_CYAN, VGA_COLOR_LIGHT_BLUE, 
+		                VGA_COLOR_LIGHT_MAGENTA};
+		for (int i = 0; i < 7; i++) {
+			terminal_setcolor(vga_entry_color(colors[i], VGA_COLOR_BLACK));
+			printf("========");
+		}
+		printf("\n\n");
+	} else {
+		printf("Usage: draw <box|line|rainbow>\n");
+	}
+	
+	terminal_setcolor(old_color);
+}
+
+static void command_timer(const char* args) {
+	while (*args == ' ') args++;
+	unsigned char old_color = terminal_getcolor();
+	
+	if (strcmp_local(args, "start") == 0) {
+		if (timer_running) {
+			printf("Timer is already running! Use 'timer stop' first.\n");
+		} else {
+			timer_start = tick_count;
+			timer_running = true;
+			terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+			printf("Timer started!\n");
+			terminal_setcolor(old_color);
+		}
+	} else if (strcmp_local(args, "stop") == 0) {
+		if (!timer_running) {
+			printf("Timer is not running! Use 'timer start' first.\n");
+		} else {
+			unsigned int elapsed = tick_count - timer_start;
+			timer_running = false;
+			terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+			printf("Timer stopped! Elapsed cycles: %u\n", elapsed);
+			terminal_setcolor(old_color);
+		}
+	} else {
+		printf("Usage: timer <start|stop>\n");
+	}
+}
+
+static void command_rps(void) {
+	unsigned char old_color = terminal_getcolor();
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_BROWN, VGA_COLOR_BLACK));
+	printf("\n========== Rock Paper Scissors ==========\n");
+	terminal_setcolor(old_color);
+	
+	printf("\n1. Rock\n2. Paper\n3. Scissors\n");
+	printf("\nYour choice (1-3): ");
+	
+	char choice_buf[MAX_COMMAND_LENGTH];
+	input_line(choice_buf, MAX_COMMAND_LENGTH);
+	
+	int player = parse_int(choice_buf);
+	if (player < 1 || player > 3) {
+		printf("Invalid choice!\n\n");
+		return;
+	}
+	
+	int computer = (simple_rand() % 3) + 1;
+	const char* choices[] = {"", "Rock", "Paper", "Scissors"};
+	
+	printf("You chose: %s\n", choices[player]);
+	printf("Computer chose: %s\n\n", choices[computer]);
+	
+	if (player == computer) {
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_BROWN, VGA_COLOR_BLACK));
+		printf("It's a tie!\n");
+	} else if ((player == 1 && computer == 3) || 
+	           (player == 2 && computer == 1) || 
+	           (player == 3 && computer == 2)) {
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+		printf("You win!\n");
+	} else {
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
+		printf("Computer wins!\n");
+	}
+	terminal_setcolor(old_color);
+	printf("\n");
+}
+
+static void command_history(void) {
+	unsigned char old_color = terminal_getcolor();
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+	printf("\n========== Command History ==========\n");
+	terminal_setcolor(old_color);
+	printf("\n");
+	
+	if (history_count == 0) {
+		printf("No commands in history.\n\n");
+		return;
+	}
+	
+	for (int i = 0; i < history_count; i++) {
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+		printf("%d. ", i + 1);
+		terminal_setcolor(old_color);
+		printf("%s\n", history_buffer[i]);
+	}
+	printf("\n");
+}
+
+static void command_halt(void) {
+	unsigned char old_color = terminal_getcolor();
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
+	printf("\n========================================\n");
+	printf("     System Halted - Goodbye!    \n");
+	printf("========================================\n\n");
+	terminal_setcolor(old_color);
+	
+	printf("Total commands executed: %u\n", command_count);
+	printf("Total shell cycles: %u\n\n", tick_count);
+	
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_BROWN, VGA_COLOR_BLACK));
+	printf("It is now safe to turn off your computer.\n\n");
+	terminal_setcolor(old_color);
+	
+	// Halt the CPU
+	while (true) {
+		__asm__ volatile ("cli; hlt");
+	}
+}
+
+static void command_randcolor(void) {
+	int fg = (simple_rand() % 15) + 1; // 1-15, avoid black text
+	int bg = simple_rand() % 8; // 0-7, darker backgrounds
+	
+	terminal_setcolor(vga_entry_color(fg, bg));
+	printf("Random colors applied! (fg=%d, bg=%d)\n", fg, bg);
 }
