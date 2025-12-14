@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <kernel/interrupt.h>
+#include <kernel/pic.h>
 #include "io.c"
 
 #include <stdint.h>
@@ -9,7 +10,7 @@
 #define IDT_MAX_DESCRIPTORS  256
 
 extern void* isr_stub_table[];
-
+extern void* irq_stub_table[];
 
 static bool vectors[IDT_MAX_DESCRIPTORS];
 
@@ -51,17 +52,20 @@ void idt_init() {
     idtr.base = (uintptr_t)&idt[0];
     idtr.limit = (uint16_t)sizeof(idt_entry_t) * IDT_MAX_DESCRIPTORS - 1;
 
+    // Set up exception handlers (0-31)
     for (uint8_t vector = 0; vector < 32; vector++) {
         idt_set_descriptor(vector, isr_stub_table[vector], 0x8E);
         vectors[vector] = true;
     }
 
+    // Remap PIC to avoid conflicts with exceptions
+    PIC_remap(0x20, 0x28);
+
+    // Set up IRQ handlers (32-47 after remapping)
+    for (uint8_t irq = 0; irq < 16; irq++) {
+        idt_set_descriptor(0x20 + irq, irq_stub_table[irq], 0x8E);
+    }
+
     __asm__ volatile ("lidt %0" : : "m"(idtr)); // load the new IDT
     __asm__ volatile ("sti"); // set the interrupt flag
-
-    // Wait for the keyboard controller to be ready
-  
-
-    outb(0x08,0xF4);
-    printf((char*)inb(0x08));
 }

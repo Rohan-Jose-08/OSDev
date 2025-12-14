@@ -33,6 +33,10 @@ void terminal_setcolor(uint8_t color) {
 	terminal_color = color;
 }
 
+uint8_t terminal_getcolor(void) {
+	return terminal_color;
+}
+
 void terminal_putentryat(unsigned char c, uint8_t color, size_t x, size_t y) {
 	const size_t index = y * VGA_WIDTH + x;
 	terminal_buffer[index] = vga_entry(c, color);
@@ -66,6 +70,14 @@ void terminal_putchar(char c) {
 	if (c == '\n'){
 		terminal_row++;
 		terminal_column = 0;
+		return;
+	}
+	
+	if (c == '\b'){
+		if (terminal_column > 0) {
+			terminal_column--;
+			terminal_putentryat(' ', terminal_color, terminal_column, terminal_row);
+		}
 		return;
 	}
 

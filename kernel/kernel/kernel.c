@@ -3,7 +3,8 @@
 #include <kernel/interrupt.h>
 #include <kernel/tty.h>
 #include <kernel/pagings.h>
-
+#include <kernel/keyboard.h>
+#include <kernel/shell.h>
 
 #include <stdint.h>
 #include <stddef.h> 
@@ -19,15 +20,26 @@ static inline bool are_interrupts_enabled()
 }
 
 void kernel_main(void) {   
-    // page_init();
-	idt_init();
-    PIC_remap(0x00,0x000);
-    
-	terminal_initialize();
-    printf("MyOS Version 1.0\n");
-    printf("Interrupts are:");
-    printf(are_interrupts_enabled()?"enabled\n":"disabled\n");
 
+	terminal_initialize();
+    
+    
+	idt_init();
+    keyboard_init();
+    
+
+    printf("MyOS Version 1.0\n");
+    printf("Interrupts are: ");
+    printf(are_interrupts_enabled()?"enabled\n":"disabled\n");
+    printf("Keyboard initialized.\n");
+    
+ 
+    shell_init();
+    
+
+    while(1) {
+        __asm__ volatile ("hlt");
+    }
 }
     
 

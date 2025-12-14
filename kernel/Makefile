@@ -23,14 +23,19 @@ ARCHDIR=arch/$(HOSTARCH)
 ASFLAGS?=
 ASFLAGS:=$(ASFLAGS) -f elf
 
-# Add a new rule for assembling exception.S
+# Add rules for assembling .S files with nasm
 $(ARCHDIR)/exception.o: $(ARCHDIR)/exception.S
+	nasm -o $@ $(ASFLAGS) $<
+
+$(ARCHDIR)/irq.o: $(ARCHDIR)/irq.S
 	nasm -o $@ $(ASFLAGS) $<
 
 # Update the KERNEL_OBJS list to include the new exception.o file
 KERNEL_OBJS=\
 $(KERNEL_ARCH_OBJS) \
 kernel/kernel.o \
+kernel/pic.o \
+kernel/shell.o \
 
 
 
