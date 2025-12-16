@@ -30,7 +30,10 @@ $(ARCHDIR)/exception.o: $(ARCHDIR)/exception.S
 $(ARCHDIR)/irq.o: $(ARCHDIR)/irq.S
 	nasm -o $@ $(ASFLAGS) $<
 
-# Update the KERNEL_OBJS list to include the new exception.o file
+$(ARCHDIR)/cpu.o: $(ARCHDIR)/cpu.S
+	$(CC) -MD -c $< -o $@ $(CFLAGS) $(CPPFLAGS)
+
+# Update the KERNEL_OBJS list to include the new files
 KERNEL_OBJS=\
 $(KERNEL_ARCH_OBJS) \
 kernel/kernel.o \

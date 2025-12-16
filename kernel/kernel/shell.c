@@ -4,6 +4,7 @@
 #include <string.h>
 #include <kernel/tty.h>
 #include <kernel/keyboard.h>
+#include <kernel/cpu.h>
 
 #define MAX_COMMAND_LENGTH 256
 
@@ -29,6 +30,15 @@ static unsigned int timer_start = 0;
 static char history_buffer[HISTORY_SIZE][MAX_COMMAND_LENGTH];
 static int history_count = 0;
 static int history_index = 0;
+
+// Command aliases
+#define MAX_ALIASES 10
+static char alias_names[MAX_ALIASES][32];
+static char alias_commands[MAX_ALIASES][MAX_COMMAND_LENGTH];
+static int alias_count = 0;
+
+// Current color theme
+static int current_theme = 0;
 
 // Simple pseudo-random number generator
 static unsigned int rand_seed = 12345;
@@ -65,6 +75,20 @@ static void command_rps(void);
 static void command_history(void);
 static void command_halt(void);
 static void command_randcolor(void);
+static void command_tictactoe(void);
+static void command_hangman(void);
+static void command_alias(const char* args);
+static void command_unalias(const char* args);
+static void command_aliases(void);
+static void command_theme(const char* args);
+static void command_fortune(void);
+static void command_animate(const char* args);
+static void command_beep(void);
+static void command_matrix(void);
+static void command_cpuinfo(void);
+static void command_rdtsc(void);
+static void command_regs(void);
+static void command_benchmark(void);
 
 static int strcmp_local(const char* s1, const char* s2) {
 	while (*s1 && (*s1 == *s2)) { s1++; s2++; }
@@ -83,6 +107,38 @@ static void strcpy_local(char* dest, const char* src) {
 		*dest++ = *src++;
 	}
 	*dest = '\0';
+}
+
+// Calculate minimum of three integers
+static int min3(int a, int b, int c) {
+	int min = a;
+	if (b < min) min = b;
+	if (c < min) min = c;
+	return min;
+}
+
+// Calculate Levenshtein distance for typo detection
+static int levenshtein_distance(const char* s1, const char* s2) {
+	int len1 = strlen(s1);
+	int len2 = strlen(s2);
+	if (len1 == 0) return len2;
+	if (len2 == 0) return len1;
+	
+	int matrix[32][32]; // Max command length support
+	for (int i = 0; i <= len1; i++) matrix[i][0] = i;
+	for (int j = 0; j <= len2; j++) matrix[0][j] = j;
+	
+	for (int i = 1; i <= len1; i++) {
+		for (int j = 1; j <= len2; j++) {
+			int cost = (s1[i-1] == s2[j-1]) ? 0 : 1;
+			matrix[i][j] = min3(
+				matrix[i-1][j] + 1,
+				matrix[i][j-1] + 1,
+				matrix[i-1][j-1] + cost
+			);
+		}
+	}
+	return matrix[len1][len2];
 }
 
 static int parse_int(const char* str) {
@@ -150,6 +206,41 @@ static void input_line(char* buffer, size_t max_length) {
 			buffer[pos] = '\0';
 			printf("\n");
 			return;
+		} else if (c == '\t') {
+			// Tab completion
+			buffer[pos] = '\0';
+			const char* commands[] = {"help", "clear", "about", "banner", "colors", "sysinfo", "uptime",
+				"guess", "art", "rps", "history", "halt", "randcolor", "echo", "color", "calc", "mem",
+				"reverse", "strlen", "upper", "lower", "rainbow", "draw", "timer", "tictactoe", "hangman",
+				"alias", "unalias", "aliases", "theme", "fortune", "animate", "beep", "matrix",
+				"cpuinfo", "rdtsc", "regs", "benchmark"};
+			int num_commands = 38;
+			
+			// Find matching commands
+			int matches = 0;
+			const char* match = NULL;
+			for (int i = 0; i < num_commands; i++) {
+				bool is_match = true;
+				for (size_t j = 0; j < pos; j++) {
+					if (buffer[j] != commands[i][j]) {
+						is_match = false;
+						break;
+					}
+				}
+				if (is_match && strlen(commands[i]) >= pos) {
+					matches++;
+					match = commands[i];
+				}
+			}
+			
+			if (matches == 1) {
+				// Complete the command
+				while (pos < strlen(match)) {
+					buffer[pos] = match[pos];
+					printf("%c", buffer[pos]);
+					pos++;
+				}
+			}
 		} else if (c == '\b') {
 			if (pos > 0) {
 				pos--;
@@ -162,6 +253,14 @@ static void input_line(char* buffer, size_t max_length) {
 }
 
 static void execute_command(const char* command) {
+	// Check aliases first
+	for (int i = 0; i < alias_count; i++) {
+		if (strcmp_local(command, alias_names[i]) == 0) {
+			execute_command(alias_commands[i]);
+			return;
+		}
+	}
+	
 	if (strcmp_local(command, "help") == 0) command_help();
 	else if (strcmp_local(command, "clear") == 0) command_clear();
 	else if (strcmp_local(command, "about") == 0) command_about();
@@ -175,6 +274,16 @@ static void execute_command(const char* command) {
 	else if (strcmp_local(command, "history") == 0) command_history();
 	else if (strcmp_local(command, "halt") == 0) command_halt();
 	else if (strcmp_local(command, "randcolor") == 0) command_randcolor();
+	else if (strcmp_local(command, "tictactoe") == 0) command_tictactoe();
+	else if (strcmp_local(command, "hangman") == 0) command_hangman();
+	else if (strcmp_local(command, "aliases") == 0) command_aliases();
+	else if (strcmp_local(command, "fortune") == 0) command_fortune();
+	else if (strcmp_local(command, "beep") == 0) command_beep();
+	else if (strcmp_local(command, "matrix") == 0) command_matrix();
+	else if (strcmp_local(command, "cpuinfo") == 0) command_cpuinfo();
+	else if (strcmp_local(command, "rdtsc") == 0) command_rdtsc();
+	else if (strcmp_local(command, "regs") == 0) command_regs();
+	else if (strcmp_local(command, "benchmark") == 0) command_benchmark();
 	else if (starts_with(command, "echo ")) command_echo(command + 5);
 	else if (starts_with(command, "color ")) command_color(command + 6);
 	else if (starts_with(command, "calc ")) command_calc(command + 5);
@@ -186,9 +295,32 @@ static void execute_command(const char* command) {
 	else if (starts_with(command, "rainbow ")) command_rainbow(command + 8);
 	else if (starts_with(command, "draw ")) command_draw(command + 5);
 	else if (starts_with(command, "timer ")) command_timer(command + 6);
+	else if (starts_with(command, "alias ")) command_alias(command + 6);
+	else if (starts_with(command, "unalias ")) command_unalias(command + 8);
+	else if (starts_with(command, "theme ")) command_theme(command + 6);
+	else if (starts_with(command, "animate ")) command_animate(command + 8);
 	else if (strcmp_local(command, "") != 0) {
 		printf("Unknown command: %s\n", command);
-		printf("Type 'help' for available commands.\n");
+		
+		// Suggest similar commands
+		const char* commands[] = {"help", "clear", "about", "banner", "colors", "sysinfo", "uptime",
+			"guess", "art", "rps", "history", "halt", "randcolor", "tictactoe", "hangman", "aliases",
+			"fortune", "beep", "matrix"};
+		int best_match = -1;
+		int best_distance = 999;
+		for (int i = 0; i < 19; i++) {
+			int dist = levenshtein_distance(command, commands[i]);
+			if (dist < best_distance && dist <= 2) {
+				best_distance = dist;
+				best_match = i;
+			}
+		}
+		
+		if (best_match >= 0) {
+			printf("Did you mean '%s'?\n", commands[best_match]);
+		} else {
+			printf("Type 'help' for available commands.\n");
+		}
 	}
 }
 
@@ -251,7 +383,32 @@ static void command_help(void) {
 	printf("Games:\n");
 	terminal_setcolor(old_color);
 	printf("  guess         - Number guessing game\n");
+	printf("  tictactoe     - Play Tic-Tac-Toe\n");
+	printf("  hangman       - Play Hangman\n");
 	
+	printf("\n");
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+	printf("Advanced Features:\n");
+	terminal_setcolor(old_color);
+	printf("  alias <n=c>   - Create command alias\n");
+	printf("  unalias <n>   - Remove alias\n");
+	printf("  aliases       - List all aliases\n");
+	printf("  theme <name>  - Change color theme (list|dark|blue|green|amber)\n");
+	printf("  fortune       - Display random fortune\n");
+	printf("  animate <t>   - Show animation (spin|progress|dots)\n");
+	printf("  beep          - Make system beep\n");
+	printf("  matrix        - Matrix-style animation\n");
+	
+	printf("\n");
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+	printf("Low-Level/Assembly Commands:\n");
+	terminal_setcolor(old_color);
+	printf("  cpuinfo       - Detailed CPU information\n");
+	printf("  rdtsc         - Read timestamp counter\n");
+	printf("  regs          - Display control registers\n");
+	printf("  benchmark     - CPU performance benchmark\n");
+	
+	printf("\nTip: Press TAB to auto-complete commands!\n");
 	printf("\n");
 }
 
@@ -910,4 +1067,491 @@ static void command_randcolor(void) {
 	
 	terminal_setcolor(vga_entry_color(fg, bg));
 	printf("Random colors applied! (fg=%d, bg=%d)\n", fg, bg);
+}
+
+static void command_tictactoe(void) {
+	unsigned char old_color = terminal_getcolor();
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+	printf("\n========== Tic-Tac-Toe ==========\n");
+	terminal_setcolor(old_color);
+	
+	char board[9] = {'1','2','3','4','5','6','7','8','9'};
+	int player = 1; // 1 = X, 2 = O
+	int moves = 0;
+	
+	while (moves < 9) {
+		// Draw board
+		printf("\n");
+		for (int i = 0; i < 9; i += 3) {
+			printf("  %c | %c | %c\n", board[i], board[i+1], board[i+2]);
+			if (i < 6) printf(" -----------\n");
+		}
+		
+		// Check for winner
+		int win_lines[8][3] = {{0,1,2},{3,4,5},{6,7,8},{0,3,6},{1,4,7},{2,5,8},{0,4,8},{2,4,6}};
+		for (int i = 0; i < 8; i++) {
+			if (board[win_lines[i][0]] == board[win_lines[i][1]] && 
+			    board[win_lines[i][1]] == board[win_lines[i][2]]) {
+				terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+				printf("\nPlayer %d wins!\n\n", player == 1 ? 2 : 1);
+				terminal_setcolor(old_color);
+				return;
+			}
+		}
+		
+		char mark = (player == 1) ? 'X' : 'O';
+		printf("\nPlayer %d (%c), enter position: ", player, mark);
+		
+		// Get input
+		while (!keyboard_has_input()) __asm__ volatile ("hlt");
+		char input = keyboard_getchar();
+		printf("%c\n", input);
+		
+		if (input >= '1' && input <= '9') {
+			int pos = input - '1';
+			if (board[pos] != 'X' && board[pos] != 'O') {
+				board[pos] = mark;
+				moves++;
+				player = (player == 1) ? 2 : 1;
+			} else {
+				printf("Position already taken!\n");
+			}
+		} else {
+			printf("Invalid input! Use 1-9.\n");
+		}
+	}
+	
+	printf("\nGame Over - It's a draw!\n\n");
+	terminal_setcolor(old_color);
+}
+
+static void command_hangman(void) {
+	unsigned char old_color = terminal_getcolor();
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+	printf("\n========== Hangman ==========\n");
+	terminal_setcolor(old_color);
+	
+	const char* words[] = {"KERNEL", "SYSTEM", "MEMORY", "TERMINAL", "COMPUTER", "PROGRAM"};
+	const char* word = words[simple_rand() % 6];
+	int word_len = strlen(word);
+	char guessed[32] = {0};
+	int wrong_guesses = 0;
+	int max_wrong = 6;
+	
+	while (wrong_guesses < max_wrong) {
+		// Show current state
+		printf("\nWord: ");
+		bool complete = true;
+		for (int i = 0; i < word_len; i++) {
+			bool found = false;
+			for (int j = 0; j < 26; j++) {
+				if (guessed[j] == word[i]) {
+					found = true;
+					break;
+				}
+			}
+			if (found) {
+				printf("%c ", word[i]);
+			} else {
+				printf("_ ");
+				complete = false;
+			}
+		}
+		
+		if (complete) {
+			terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+			printf("\n\nYou won! The word was: %s\n\n", word);
+			terminal_setcolor(old_color);
+			return;
+		}
+		
+		printf("\nWrong guesses: %d/%d\n", wrong_guesses, max_wrong);
+		printf("Guessed: ");
+		for (int i = 0; i < 26 && guessed[i]; i++) {
+			printf("%c ", guessed[i]);
+		}
+		printf("\nGuess a letter: ");
+		
+		while (!keyboard_has_input()) __asm__ volatile ("hlt");
+		char input = keyboard_getchar();
+		printf("%c\n", input);
+		
+		if (input >= 'a' && input <= 'z') input -= 32; // Uppercase
+		
+		if (input >= 'A' && input <= 'Z') {
+			// Check if already guessed
+			bool already = false;
+			for (int i = 0; i < 26; i++) {
+				if (guessed[i] == input) {
+					already = true;
+					break;
+				}
+			}
+			
+			if (already) {
+				printf("Already guessed that letter!\n");
+				continue;
+			}
+			
+			// Add to guessed
+			for (int i = 0; i < 26; i++) {
+				if (!guessed[i]) {
+					guessed[i] = input;
+					break;
+				}
+			}
+			
+			// Check if in word
+			bool in_word = false;
+			for (int i = 0; i < word_len; i++) {
+				if (word[i] == input) {
+					in_word = true;
+					break;
+				}
+			}
+			
+			if (!in_word) {
+				wrong_guesses++;
+				printf("Wrong!\n");
+			} else {
+				printf("Correct!\n");
+			}
+		}
+	}
+	
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
+	printf("\nYou lost! The word was: %s\n\n", word);
+	terminal_setcolor(old_color);
+}
+
+static void command_alias(const char* args) {
+	if (alias_count >= MAX_ALIASES) {
+		printf("Maximum aliases reached!\n");
+		return;
+	}
+	
+	// Parse name=command
+	char name[32] = {0};
+	char cmd[MAX_COMMAND_LENGTH] = {0};
+	int i = 0;
+	while (args[i] && args[i] != '=' && i < 31) {
+		name[i] = args[i];
+		i++;
+	}
+	
+	if (args[i] != '=') {
+		printf("Usage: alias name=command\n");
+		return;
+	}
+	
+	i++; // Skip '='
+	int j = 0;
+	while (args[i] && j < MAX_COMMAND_LENGTH - 1) {
+		cmd[j++] = args[i++];
+	}
+	
+	strcpy_local(alias_names[alias_count], name);
+	strcpy_local(alias_commands[alias_count], cmd);
+	alias_count++;
+	
+	printf("Alias created: %s = %s\n", name, cmd);
+}
+
+static void command_unalias(const char* args) {
+	for (int i = 0; i < alias_count; i++) {
+		if (strcmp_local(alias_names[i], args) == 0) {
+			// Shift remaining aliases
+			for (int j = i; j < alias_count - 1; j++) {
+				strcpy_local(alias_names[j], alias_names[j+1]);
+				strcpy_local(alias_commands[j], alias_commands[j+1]);
+			}
+			alias_count--;
+			printf("Alias removed: %s\n", args);
+			return;
+		}
+	}
+	printf("Alias not found: %s\n", args);
+}
+
+static void command_aliases(void) {
+	unsigned char old_color = terminal_getcolor();
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+	printf("\n========== Command Aliases ==========\n");
+	terminal_setcolor(old_color);
+	printf("\n");
+	
+	if (alias_count == 0) {
+		printf("No aliases defined.\n");
+		printf("Use 'alias name=command' to create one.\n");
+	} else {
+		for (int i = 0; i < alias_count; i++) {
+			terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+			printf("%s", alias_names[i]);
+			terminal_setcolor(old_color);
+			printf(" = %s\n", alias_commands[i]);
+		}
+	}
+	printf("\n");
+}
+
+static void command_theme(const char* args) {
+	unsigned char old_color = terminal_getcolor();
+	
+	if (strcmp_local(args, "dark") == 0) {
+		current_theme = 0;
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK));
+		printf("Theme set to: Dark\n");
+	} else if (strcmp_local(args, "blue") == 0) {
+		current_theme = 1;
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLUE));
+		printf("Theme set to: Blue\n");
+	} else if (strcmp_local(args, "green") == 0) {
+		current_theme = 2;
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+		printf("Theme set to: Green (Matrix)\n");
+	} else if (strcmp_local(args, "amber") == 0) {
+		current_theme = 3;
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_BROWN, VGA_COLOR_BLACK));
+		printf("Theme set to: Amber (Retro)\n");
+	} else if (strcmp_local(args, "list") == 0) {
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+		printf("\nAvailable themes:\n");
+		terminal_setcolor(old_color);
+		printf("  dark  - Classic dark terminal\n");
+		printf("  blue  - Blue ocean theme\n");
+		printf("  green - Matrix/hacker theme\n");
+		printf("  amber - Retro amber monitor\n");
+		printf("\nUsage: theme <name>\n");
+	} else {
+		printf("Unknown theme. Use 'theme list' to see available themes.\n");
+	}
+}
+
+static void command_fortune(void) {
+	const char* fortunes[] = {
+		"A bug in the code is worth two in the documentation.",
+		"The best way to predict the future is to implement it.",
+		"Code never lies, comments sometimes do.",
+		"Simplicity is the ultimate sophistication.",
+		"First, solve the problem. Then, write the code.",
+		"The only way to go fast is to go well.",
+		"Programs must be written for people to read.",
+		"Make it work, make it right, make it fast.",
+		"The best code is no code at all.",
+		"Any fool can write code that a computer can understand.",
+		"Good programmers write good code. Great programmers steal great code.",
+		"Debugging is twice as hard as writing the code in the first place."
+	};
+	
+	int idx = simple_rand() % 12;
+	unsigned char old_color = terminal_getcolor();
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_MAGENTA, VGA_COLOR_BLACK));
+	printf("\n========================================\n");
+	printf("  Fortune Cookie\n");
+	printf("========================================\n");
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+	printf("\n%s\n\n", fortunes[idx]);
+	terminal_setcolor(old_color);
+}
+
+static void command_animate(const char* args) {
+	if (strcmp_local(args, "spin") == 0) {
+		char spinner[] = {'|', '/', '-', '\\\\'};
+		printf("\nSpinning: ");
+		for (int i = 0; i < 20; i++) {
+			printf("%c\b", spinner[i % 4]);
+			for (volatile int j = 0; j < 1000000; j++);
+		}
+		printf("Done!\n\n");
+	} else if (strcmp_local(args, "progress") == 0) {
+		printf("\nProgress: [");
+		for (int i = 0; i <= 20; i++) {
+			printf("#");
+			for (volatile int j = 0; j < 2000000; j++);
+		}
+		printf("] Complete!\n\n");
+	} else if (strcmp_local(args, "dots") == 0) {
+		printf("\nLoading");
+		for (int i = 0; i < 10; i++) {
+			printf(".");
+			for (volatile int j = 0; j < 2000000; j++);
+		}
+		printf(" Done!\n\n");
+	} else {
+		printf("Available animations: spin, progress, dots\n");
+		printf("Usage: animate <type>\n");
+	}
+}
+
+static void command_beep(void) {
+	// PC speaker control via port 0x61
+	unsigned char tmp = __builtin_ia32_inb(0x61);
+	
+	// Enable speaker
+	__builtin_ia32_outb(0x61, tmp | 0x03);
+	for (volatile int i = 0; i < 1000000; i++);
+	
+	// Disable speaker
+	__builtin_ia32_outb(0x61, tmp);
+	
+	printf("*BEEP*\n");
+}
+
+static void command_matrix(void) {
+	unsigned char old_color = terminal_getcolor();
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+	
+	printf("\n--- MATRIX MODE ACTIVATED ---\n\n");
+	
+	for (int line = 0; line < 10; line++) {
+		for (int col = 0; col < 40; col++) {
+			char c = (simple_rand() % 94) + 33;
+			printf("%c", c);
+		}
+		printf("\n");
+		for (volatile int i = 0; i < 1000000; i++);
+	}
+	
+	printf("\n--- MATRIX MODE DEACTIVATED ---\n\n");
+	terminal_setcolor(old_color);
+}
+
+static void command_cpuinfo(void) {
+	unsigned char old_color = terminal_getcolor();
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+	printf("\n========== CPU Information ==========\n");
+	terminal_setcolor(old_color);
+	printf("\n");
+	
+	cpu_info_t info;
+	cpu_detect(&info);
+	cpu_print_info(&info);
+	
+	printf("\n");
+}
+
+static void command_rdtsc(void) {
+	unsigned char old_color = terminal_getcolor();
+	
+	if (!cpu_has_feature(CPUID_FEAT_EDX_TSC)) {
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
+		printf("\nTSC not supported on this CPU!\n\n");
+		terminal_setcolor(old_color);
+		return;
+	}
+	
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+	printf("\n========== Timestamp Counter ==========\n");
+	terminal_setcolor(old_color);
+	printf("\n");
+	
+	uint64_t tsc1 = rdtsc();
+	printf("TSC Value: 0x%08X%08X\n", (uint32_t)(tsc1 >> 32), (uint32_t)tsc1);
+	
+	// Measure some time
+	for (volatile int i = 0; i < 10000000; i++);
+	
+	uint64_t tsc2 = rdtsc();
+	printf("After delay: 0x%08X%08X\n", (uint32_t)(tsc2 >> 32), (uint32_t)tsc2);
+	
+	uint64_t diff = tsc2 - tsc1;
+	printf("Cycles elapsed: %u\n", (uint32_t)diff);
+	printf("\n");
+}
+
+static void command_regs(void) {
+	unsigned char old_color = terminal_getcolor();
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+	printf("\n========== Control Registers ==========\n");
+	terminal_setcolor(old_color);
+	printf("\n");
+	
+	uint32_t cr0 = read_cr0();
+	uint32_t cr2 = read_cr2();
+	uint32_t cr3 = read_cr3();
+	uint32_t cr4 = read_cr4();
+	uint32_t eflags = read_eflags();
+	
+	printf("CR0: 0x%08X\n", cr0);
+	printf("  PE (Protected Mode):     %s\n", (cr0 & CR0_PE) ? "Enabled" : "Disabled");
+	printf("  PG (Paging):             %s\n", (cr0 & CR0_PG) ? "Enabled" : "Disabled");
+	printf("  WP (Write Protect):      %s\n", (cr0 & CR0_WP) ? "Enabled" : "Disabled");
+	printf("  CD (Cache Disable):      %s\n", (cr0 & CR0_CD) ? "Disabled" : "Enabled");
+	
+	printf("\nCR2 (Page Fault Addr): 0x%08X\n", cr2);
+	printf("CR3 (Page Directory):  0x%08X\n", cr3);
+	
+	printf("\nCR4: 0x%08X\n", cr4);
+	printf("  PSE (Page Size Ext):     %s\n", (cr4 & CR4_PSE) ? "Enabled" : "Disabled");
+	printf("  PAE (Phys Addr Ext):     %s\n", (cr4 & CR4_PAE) ? "Enabled" : "Disabled");
+	printf("  PGE (Page Global):       %s\n", (cr4 & CR4_PGE) ? "Enabled" : "Disabled");
+	
+	printf("\nEFLAGS: 0x%08X\n", eflags);
+	printf("  CF (Carry):              %s\n", (eflags & (1 << 0)) ? "Set" : "Clear");
+	printf("  ZF (Zero):               %s\n", (eflags & (1 << 6)) ? "Set" : "Clear");
+	printf("  SF (Sign):               %s\n", (eflags & (1 << 7)) ? "Set" : "Clear");
+	printf("  IF (Interrupt Enable):   %s\n", (eflags & (1 << 9)) ? "Enabled" : "Disabled");
+	
+	printf("\n");
+}
+
+static void command_benchmark(void) {
+	unsigned char old_color = terminal_getcolor();
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+	printf("\n========== CPU Benchmark ==========\n");
+	terminal_setcolor(old_color);
+	printf("\n");
+	
+	if (!cpu_has_feature(CPUID_FEAT_EDX_TSC)) {
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
+		printf("TSC not available - cannot benchmark!\n\n");
+		terminal_setcolor(old_color);
+		return;
+	}
+	
+	// Integer arithmetic benchmark
+	printf("Running integer arithmetic test...\n");
+	uint64_t start = rdtsc();
+	volatile int sum = 0;
+	for (int i = 0; i < 1000000; i++) {
+		sum += i;
+	}
+	uint64_t end = rdtsc();
+	printf("  1M iterations: %u cycles\n", (uint32_t)(end - start));
+	
+	// Memory access benchmark
+	printf("Running memory access test...\n");
+	volatile char test_array[1024];
+	start = rdtsc();
+	for (int i = 0; i < 10000; i++) {
+		for (int j = 0; j < 1024; j++) {
+			test_array[j] = (char)j;
+		}
+	}
+	end = rdtsc();
+	printf("  10K * 1KB writes: %u cycles\n", (uint32_t)(end - start));
+	
+	// Division benchmark
+	printf("Running division test...\n");
+	start = rdtsc();
+	volatile int result = 0;
+	for (int i = 1; i < 10000; i++) {
+		result = 1000000 / i;
+	}
+	end = rdtsc();
+	printf("  10K divisions: %u cycles\n", (uint32_t)(end - start));
+	
+	// Atomic operations benchmark
+	printf("Running atomic operations test...\n");
+	int atomic_var = 0;
+	start = rdtsc();
+	for (int i = 0; i < 100000; i++) {
+		atomic_inc(&atomic_var);
+	}
+	end = rdtsc();
+	printf("  100K atomic incs: %u cycles\n", (uint32_t)(end - start));
+	
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+	printf("\nBenchmark complete!\n\n");
+	terminal_setcolor(old_color);
 }
