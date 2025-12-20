@@ -6,6 +6,15 @@
 #include <kernel/keyboard.h>
 #include <kernel/cpu.h>
 #include <kernel/io.h>
+#include <kernel/editor.h>
+#include <kernel/vfs.h>
+#include <kernel/mouse.h>
+#include <kernel/snake.h>
+#include <kernel/graphics_demo.h>
+#include <kernel/graphics.h>
+#include <kernel/task.h>
+#include <kernel/timer.h>
+
 
 #define MAX_COMMAND_LENGTH 256
 
@@ -40,6 +49,9 @@ static int alias_count = 0;
 
 // Current color theme
 static int current_theme = 0;
+
+// Current working directory
+static vfs_node_t *current_directory = NULL;
 
 // Simple pseudo-random number generator
 static unsigned int rand_seed = 12345;
@@ -90,6 +102,7 @@ static void command_halt(void);
 static void command_randcolor(void);
 static void command_tictactoe(void);
 static void command_hangman(void);
+static void command_snake(void);
 static void command_alias(const char* args);
 static void command_unalias(const char* args);
 static void command_aliases(void);
@@ -102,6 +115,22 @@ static void command_cpuinfo(void);
 static void command_rdtsc(void);
 static void command_regs(void);
 static void command_benchmark(void);
+static void command_display(const char* args);
+static void command_edit(const char* args);
+static void command_gfx(void);
+static void command_gfxanim(void);
+static void command_gfxpaint(void);
+static void command_ls(const char* args);
+static void command_cat(const char* args);
+static void command_rm(const char* args);
+static void command_touch(const char* args);
+static void command_mkdir(const char* args);
+static void command_rmdir(const char* args);
+static void command_cd(const char* args);
+static void command_pwd(void);
+static void command_ps(void);
+static void command_kill(const char* args);
+static void command_spawn(const char* args);
 
 static int strcmp_local(const char* s1, const char* s2) {
 	while (*s1 && (*s1 == *s2)) { s1++; s2++; }
@@ -180,6 +209,10 @@ static unsigned int parse_hex(const char* str) {
 
 void shell_init(void) {
 	char command[MAX_COMMAND_LENGTH];
+	
+	// Initialize current directory to root
+	current_directory = vfs_get_root();
+	
 	command_banner();
 	
 	while (true) {
@@ -200,6 +233,7 @@ void shell_init(void) {
 				}
 				strcpy_local(history_buffer[HISTORY_SIZE - 1], command);
 			}
+			history_index = history_count; // Reset to end of history
 			
 			execute_command(command);
 		}
@@ -207,14 +241,42 @@ void shell_init(void) {
 }
 
 static void output_prompt(void) {
-	printf("myos> ");
+	char path[VFS_MAX_PATH_LEN];
+	
+	if (current_directory && vfs_get_full_path(current_directory, path, sizeof(path))) {
+		printf("myos:%s> ", path);
+	} else {
+		printf("myos> ");
+	}
 }
 
 static void input_line(char* buffer, size_t max_length) {
-	size_t pos = 0;
+	size_t pos = 0;  // Length of buffer
+	size_t cursor_pos = 0;  // Cursor position in buffer
+	static int8_t last_scroll = 0;
+	
+	// Store the starting position of input (after the prompt)
+	size_t start_row = terminal_get_row();
+	size_t start_col = terminal_get_column();
+	
 	while (true) {
-		while (!keyboard_has_input()) __asm__ volatile ("hlt");
-		char c = keyboard_getchar();
+		// Check for mouse scroll events
+		mouse_state_t mouse = mouse_get_state();
+		if (mouse.scroll != last_scroll) {
+			if (mouse.scroll < 0) {
+				terminal_scroll_up();
+			} else if (mouse.scroll > 0) {
+				terminal_scroll_down();
+			}
+			last_scroll = mouse.scroll;
+		}
+		
+		if (!keyboard_has_input()) {
+			__asm__ volatile ("hlt");
+			continue;
+		}
+		
+		unsigned char c = keyboard_getchar();
 		if (c == '\n') {
 			buffer[pos] = '\0';
 			printf("\n");
@@ -226,8 +288,8 @@ static void input_line(char* buffer, size_t max_length) {
 				"guess", "art", "rps", "history", "halt", "randcolor", "echo", "color", "calc", "mem",
 				"reverse", "strlen", "upper", "lower", "rainbow", "draw", "timer", "tictactoe", "hangman",
 				"alias", "unalias", "aliases", "theme", "fortune", "animate", "beep", "matrix",
-				"cpuinfo", "rdtsc", "regs", "benchmark"};
-			int num_commands = 38;
+				"cpuinfo", "rdtsc", "regs", "benchmark", "edit", "display", "ls", "cat", "rm", "touch"};
+			int num_commands = 44;
 			
 			// Find matching commands
 			int matches = 0;
@@ -253,15 +315,91 @@ static void input_line(char* buffer, size_t max_length) {
 					printf("%c", buffer[pos]);
 					pos++;
 				}
+				cursor_pos = pos;
 			}
 		} else if (c == '\b') {
-			if (pos > 0) {
+			if (cursor_pos > 0) {
+				// Delete character before cursor
+				cursor_pos--;
+				// Shift characters after cursor left
+				for (size_t i = cursor_pos; i < pos; i++) {
+					buffer[i] = buffer[i + 1];
+				}
 				pos--;
-				printf("\b \b");
+				
+				// Redraw from cursor to end
+				printf("\b");
+				for (size_t i = cursor_pos; i < pos; i++) {
+					printf("%c", buffer[i]);
+				}
+				printf(" \b");
+				// Move cursor back to correct position
+				for (size_t i = cursor_pos; i < pos; i++) {
+					printf("\b");
+				}
+			}
+		} else if (c == 0x80) { // Up arrow - previous history
+			if (history_count > 0) {
+				if (history_index > 0) {
+					history_index--;
+				} else {
+					history_index = history_count - 1;
+				}
+				// Clear current line
+				for (size_t i = 0; i < pos; i++) printf("\b \b");
+				// Copy history to buffer
+				strcpy_local(buffer, history_buffer[history_index]);
+				pos = strlen(buffer);
+				cursor_pos = pos;
+				printf("%s", buffer);
+			}
+		} else if (c == 0x81) { // Down arrow - next history
+			if (history_count > 0) {
+				history_index = (history_index + 1) % history_count;
+				// Clear current line
+				for (size_t i = 0; i < pos; i++) printf("\b \b");
+				// Copy history to buffer
+				strcpy_local(buffer, history_buffer[history_index]);
+				pos = strlen(buffer);
+				cursor_pos = pos;
+				printf("%s", buffer);
+			}
+		} else if (c == 0x82) { // Left arrow
+			if (cursor_pos > 0) {
+				cursor_pos--;
+				// Calculate absolute cursor position
+				size_t abs_col = start_col + cursor_pos;
+				size_t abs_row = start_row + (abs_col / terminal_get_width());
+				abs_col = abs_col % terminal_get_width();
+				terminal_update_cursor(abs_col, abs_row);
+			}
+		} else if (c == 0x83) { // Right arrow
+			if (cursor_pos < pos) {
+				cursor_pos++;
+				// Calculate absolute cursor position
+				size_t abs_col = start_col + cursor_pos;
+				size_t abs_row = start_row + (abs_col / terminal_get_width());
+				abs_col = abs_col % terminal_get_width();
+				terminal_update_cursor(abs_col, abs_row);
 			}
 		} else if (c >= 32 && c < 127 && pos < max_length - 1) {
-			buffer[pos++] = c;
-			printf("%c", c);
+			// Insert character at cursor position
+			// Shift characters after cursor right
+			for (size_t i = pos; i > cursor_pos; i--) {
+				buffer[i] = buffer[i - 1];
+			}
+			buffer[cursor_pos] = c;
+			pos++;
+			
+			// Redraw from cursor to end
+			for (size_t i = cursor_pos; i < pos; i++) {
+				printf("%c", buffer[i]);
+			}
+			cursor_pos++;
+			// Move cursor back to correct position
+			for (size_t i = cursor_pos; i < pos; i++) {
+				printf("\b");
+			}
 		}
 	}
 }
@@ -292,6 +430,7 @@ static void execute_command(const char* command) {
 		{"randcolor", command_randcolor, NULL, false},
 		{"tictactoe", command_tictactoe, NULL, false},
 		{"hangman", command_hangman, NULL, false},
+		{"snake", command_snake, NULL, false},
 		{"aliases", command_aliases, NULL, false},
 		{"fortune", command_fortune, NULL, false},
 		{"beep", command_beep, NULL, false},
@@ -300,6 +439,9 @@ static void execute_command(const char* command) {
 		{"rdtsc", command_rdtsc, NULL, false},
 		{"regs", command_regs, NULL, false},
 		{"benchmark", command_benchmark, NULL, false},
+		{"gfx", command_gfx, NULL, false},
+		{"gfxanim", command_gfxanim, NULL, false},
+		{"gfxpaint", command_gfxpaint, NULL, false},
 		{"echo", NULL, command_echo, true},
 		{"color", NULL, command_color, true},
 		{"calc", NULL, command_calc, true},
@@ -315,6 +457,19 @@ static void execute_command(const char* command) {
 		{"unalias", NULL, command_unalias, true},
 		{"theme", NULL, command_theme, true},
 		{"animate", NULL, command_animate, true},
+		{"display", NULL, command_display, true},
+		{"edit", NULL, command_edit, true},
+		{"ls", NULL, command_ls, true},
+		{"cat", NULL, command_cat, true},
+		{"rm", NULL, command_rm, true},
+		{"touch", NULL, command_touch, true},
+		{"mkdir", NULL, command_mkdir, true},
+		{"rmdir", NULL, command_rmdir, true},
+		{"cd", NULL, command_cd, true},
+		{"pwd", command_pwd, NULL, false},
+		{"ps", command_ps, NULL, false},
+		{"kill", NULL, command_kill, true},
+		{"spawn", NULL, command_spawn, true},
 	};
 	
 	const int num_commands = sizeof(command_table) / sizeof(command_entry_t);
@@ -409,6 +564,7 @@ static void command_help(void) {
 	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
 	printf("Display Commands:\n");
 	terminal_setcolor(old_color);
+	printf("  display <mode> - Change display mode (80x25, 80x50, 320x200)\n");
 	printf("  echo <text>   - Echo text to the screen\n");
 	printf("  color <fg> <bg> - Set text colors (0-15)\n");
 	printf("  colors        - Show available colors\n");
@@ -429,6 +585,7 @@ static void command_help(void) {
 	printf("  guess         - Number guessing game\n");
 	printf("  tictactoe     - Play Tic-Tac-Toe\n");
 	printf("  hangman       - Play Hangman\n");
+	printf("  snake         - Play Snake Game (WASD to move, Q to quit)\n");
 	
 	printf("\n");
 	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
@@ -451,6 +608,45 @@ static void command_help(void) {
 	printf("  rdtsc         - Read timestamp counter\n");
 	printf("  regs          - Display control registers\n");
 	printf("  benchmark     - CPU performance benchmark\n");
+	
+	printf("\n");
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+	printf("Editor & Display:\n");
+	terminal_setcolor(old_color);
+	printf("  edit <file>     - Text editor (vi-like)\n");
+	printf("  display <mode>  - Change display mode (80x25, 80x50, info)\n");
+	printf("  Mouse Wheel     - Scroll terminal display up/down\n");
+	printf("  Arrow Up/Down   - Navigate command history\n");
+	printf("  Type anything   - Return to current view\n");
+	
+	printf("\n");
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+	printf("File System:\n");
+	terminal_setcolor(old_color);
+	printf("  ls [path]     - List directory contents\n");
+	printf("  cat <file>    - Display file contents\n");
+	printf("  touch <file>  - Create empty file\n");
+	printf("  rm <file>     - Delete file\n");
+	printf("  mkdir <dir>   - Create directory\n");
+	printf("  rmdir <dir>   - Remove empty directory\n");
+	printf("  cd [path]     - Change directory\n");
+	printf("  pwd           - Print working directory\n");
+	
+	printf("\n");
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+	printf("Multitasking:\n");
+	terminal_setcolor(old_color);
+	printf("  ps            - List running tasks/processes\n");
+	printf("  spawn <task>  - Create new task (demo1, demo2, demo3)\n");
+	printf("  kill <pid>    - Terminate task by PID\n");
+	
+	printf("\n");
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+	printf("Graphics Mode (Mode 13h - 320x200, 256 colors):\n");
+	terminal_setcolor(old_color);
+	printf("  gfx           - Graphics demonstration (shapes, colors)\n");
+	printf("  gfxanim       - Bouncing ball animation\n");
+	printf("  gfxpaint      - Paint demo\n");
 	
 	printf("\nTip: Press TAB to auto-complete commands!\n");
 	printf("\n");
@@ -485,7 +681,7 @@ static void command_about(void) {
 	printf("  [+] VGA text mode display (80x25, 16 colors)\n");
 	printf("  [+] PS/2 keyboard input support\n");
 	printf("  [+] Interactive shell with command processing\n");
-	printf("  [+] Color rendering support\n");
+	printf("  [+] Color rende ring support\n");
 	printf("  [+] Basic arithmetic calculator\n");
 	printf("  [+] Memory viewer utility\n");
 	printf("  [+] Mini-games (number guessing)\n");
@@ -1268,6 +1464,27 @@ static void command_hangman(void) {
 	terminal_setcolor(old_color);
 }
 
+static void command_snake(void) {
+	unsigned char old_color = terminal_getcolor();
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+	printf("\n========== Snake Game ==========\n");
+	terminal_setcolor(old_color);
+	printf("Use WASD to move, Q or ESC to quit\n");
+	printf("Press any key to start...\n");
+	
+	// Wait for key
+	keyboard_clear_buffer();
+	while (!keyboard_has_input()) {
+		__asm__ volatile ("hlt");
+	}
+	keyboard_getchar();
+	
+	// Start game
+	snake_game();
+	
+	terminal_setcolor(old_color);
+}
+
 static void command_alias(const char* args) {
 	if (alias_count >= MAX_ALIASES) {
 		printf("Maximum aliases reached!\n");
@@ -1598,4 +1815,477 @@ static void command_benchmark(void) {
 	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
 	printf("\nBenchmark complete!\n\n");
 	terminal_setcolor(old_color);
+}
+
+static void command_edit(const char* args) {
+	while (*args == ' ') args++;
+	
+	if (!*args || strcmp_local(args, "") == 0) {
+		printf("Usage: edit <filename>\n");
+		printf("\nEditor commands:\n");
+		printf("  ESC    - Enter normal mode\n");
+		printf("  i      - Enter insert mode\n");
+		printf("  a      - Append (insert after cursor)\n");
+		printf("  o      - Open new line below\n");
+		printf("  O      - Open new line above\n");
+		printf("  x      - Delete character\n");
+		printf("  dd     - Delete line\n");
+		printf("  h/j/k/l- Move cursor (left/down/up/right)\n");
+		printf("  0      - Start of line\n");
+		printf("  $      - End of line\n");
+		printf("  gg     - First line\n");
+		printf("  G      - Last line\n");
+		printf("  :w     - Save\n");
+		printf("  :q     - Quit\n");
+		printf("  :wq    - Save and quit\n");
+		printf("  :q!    - Quit without saving\n");
+		return;
+	}
+	
+	// Build absolute path if needed
+	char abs_path[VFS_MAX_PATH_LEN];
+	if (args[0] == '/') {
+		// Already absolute
+		strncpy(abs_path, args, VFS_MAX_PATH_LEN - 1);
+		abs_path[VFS_MAX_PATH_LEN - 1] = '\0';
+	} else {
+		// Build absolute path from current directory
+		if (!current_directory || !vfs_get_full_path(current_directory, abs_path, sizeof(abs_path))) {
+			printf("edit: cannot determine current directory\n");
+			return;
+		}
+		
+		size_t abs_len = strlen(abs_path);
+		if (abs_len > 0 && abs_path[abs_len - 1] != '/') {
+			if (abs_len + 1 >= VFS_MAX_PATH_LEN) {
+				printf("edit: path too long\n");
+				return;
+			}
+			abs_path[abs_len++] = '/';
+			abs_path[abs_len] = '\0';
+		}
+		
+		if (abs_len + strlen(args) >= VFS_MAX_PATH_LEN) {
+			printf("edit: path too long\n");
+			return;
+		}
+		
+		strcat(abs_path, args);
+	}
+	
+	editor_run(abs_path);
+}
+
+static void command_display(const char* args) {
+	if (!args) args = "";
+	
+	unsigned char old_color = terminal_getcolor();
+	
+	if (strcmp_local(args, "80x25") == 0) {
+		terminal_set_mode_80x25();
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+		printf("Display mode set to 80x25\n");
+		terminal_setcolor(old_color);
+	} else if (strcmp_local(args, "80x50") == 0) {
+		terminal_set_mode_80x50();
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+		printf("Display mode set to 80x50\n");
+		terminal_setcolor(old_color);
+	} else if (strcmp_local(args, "320x200") == 0) {
+		graphics_set_mode(MODE_13H);
+		graphics_clear(COLOR_BLACK);
+		graphics_print(10, 10, "Graphics mode 320x200 active", COLOR_WHITE, COLOR_BLACK);
+		graphics_print(10, 20, "Press ESC to return to text mode", COLOR_YELLOW, COLOR_BLACK);
+		while (keyboard_getchar() != 27); // Wait for ESC
+		graphics_set_mode(MODE_TEXT);
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+		printf("Returned to text mode\n");
+		terminal_setcolor(old_color);
+	} else if (strcmp_local(args, "320x240") == 0) {
+		graphics_set_mode(MODE_320x240);
+		graphics_clear(COLOR_BLACK);
+		graphics_print(10, 10, "Graphics mode 320x240 active", COLOR_WHITE, COLOR_BLACK);
+		graphics_print(10, 20, "Press ESC to return to text mode", COLOR_YELLOW, COLOR_BLACK);
+		while (keyboard_getchar() != 27); // Wait for ESC
+		graphics_set_mode(MODE_TEXT);
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+		printf("Returned to text mode\n");
+		terminal_setcolor(old_color);
+	} else if (strcmp_local(args, "info") == 0 || strcmp_local(args, "") == 0) {
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+		printf("\n========== Display Settings ==========\n");
+		terminal_setcolor(old_color);
+		printf("\n");
+		printf("Current mode: %ux%u\n", (unsigned int)terminal_get_width(), (unsigned int)terminal_get_height());
+		printf("\n");
+		printf("Available modes:\n");
+		printf("  Text Modes:\n");
+		printf("    80x25   - Standard VGA text mode\n");
+		printf("    80x50   - Extended VGA text mode (8-line font)\n");
+		printf("  Graphics Modes:\n");
+		printf("    320x200 - Mode 13h (256 colors)\n");
+		printf("    320x240 - Alias for 320x200\n");
+		printf("\n");
+		printf("Usage: display <mode>\n");
+		printf("Example: display 80x50\n");
+		printf("\n");
+		printf("Mouse scrolling: Enabled\n");
+		printf("  Use mouse wheel to scroll through terminal history\n");
+		printf("\n");
+	} else {
+		printf("Unknown display mode: %s\n", args);
+		printf("Available modes: 80x25, 80x50, 320x200\n");
+		printf("Type 'display info' for more information.\n");
+	}
+}
+
+// VFS command implementations
+static void command_ls(const char* args) {
+	vfs_node_t *dir;
+	
+	
+	if (args && strlen(args) > 0) {
+		dir = vfs_resolve_relative_path(args, current_directory);
+		if (!dir) {
+			printf("ls: cannot access '%s': No such file or directory\n", args);
+			return;
+		}
+	} else {
+		dir = current_directory;
+		if (!dir) {
+			printf("ls: current directory not set\n");
+			return;
+		}
+	}
+	
+	if (dir->type != VFS_DIRECTORY) {
+		printf("ls: Not a directory\n");
+		return;
+	}
+	
+	vfs_node_t *children[VFS_MAX_CHILDREN];
+	int count = vfs_list_dir(dir, children, VFS_MAX_CHILDREN);
+	
+	
+	if (count <= 0) {
+		return;
+	}
+	
+	for (int i = 0; i < count; i++) {
+		if (!children[i]) {
+			continue;
+		}
+		if (children[i]->type == VFS_DIRECTORY) {
+			printf("[DIR]  %s\n", children[i]->name);
+		} else {
+			printf("[FILE] %s (%u bytes)\n", children[i]->name, children[i]->size);
+		}
+	}
+}
+
+static void command_cat(const char* args) {
+	if (!args || strlen(args) == 0) {
+		printf("cat: missing file operand\n");
+		printf("Usage: cat <filename>\n");
+		return;
+	}
+	
+	uint8_t buffer[4096];
+	int bytes_read = vfs_read_path_relative(args, current_directory, buffer, sizeof(buffer) - 1, 0);
+	
+	if (bytes_read < 0) {
+		printf("cat: %s: No such file or directory\n", args);
+		return;
+	}
+	
+	buffer[bytes_read] = '\0';
+	printf("%s\n", (char*)buffer);
+}
+
+static void command_rm(const char* args) {
+	if (!args || strlen(args) == 0) {
+		printf("rm: missing operand\n");
+		printf("Usage: rm <filename>\n");
+		return;
+	}
+	
+	// Parse path to get parent and filename
+	char path_copy[VFS_MAX_PATH_LEN];
+	strncpy(path_copy, args, VFS_MAX_PATH_LEN - 1);
+	path_copy[VFS_MAX_PATH_LEN - 1] = '\0';
+	
+	char *last_slash = strrchr(path_copy, '/');
+	if (!last_slash) {
+		printf("rm: invalid path\n");
+		return;
+	}
+	
+	*last_slash = '\0';
+	const char *filename = last_slash + 1;
+	const char *dir_path = path_copy[0] == '\0' ? "/" : path_copy;
+	
+	vfs_node_t *parent = vfs_resolve_path(dir_path);
+	if (!parent) {
+		printf("rm: cannot remove '%s': No such file or directory\n", args);
+		return;
+	}
+	
+	if (vfs_delete(parent, filename) == 0) {
+		printf("Removed '%s'\n", args);
+	} else {
+		printf("rm: cannot remove '%s': No such file or directory\n", args);
+	}
+}
+
+static void command_touch(const char* args) {
+	if (!args || strlen(args) == 0) {
+		printf("touch: missing file operand\n");
+		printf("Usage: touch <filename>\n");
+		return;
+	}
+	
+	// Check if file already exists
+	vfs_node_t *existing = vfs_resolve_relative_path(args, current_directory);
+	if (existing) {
+		printf("File '%s' already exists\n", args);
+		return;
+	}
+	
+	// Create empty file
+	const uint8_t empty[] = "";
+	if (vfs_write_path_relative(args, current_directory, empty, 0) >= 0) {
+		printf("Created file '%s'\n", args);
+	} else {
+		printf("touch: cannot create '%s': No such file or directory\n", args);
+	}
+}
+
+static void command_mkdir(const char* args) {
+	if (!args || strlen(args) == 0) {
+		printf("mkdir: missing operand\n");
+		printf("Usage: mkdir <directory>\n");
+		return;
+	}
+	
+	// Parse path to get parent and directory name
+	char path_copy[VFS_MAX_PATH_LEN];
+	strncpy(path_copy, args, VFS_MAX_PATH_LEN - 1);
+	path_copy[VFS_MAX_PATH_LEN - 1] = '\0';
+	
+	char *last_slash = strrchr(path_copy, '/');
+	if (!last_slash) {
+		printf("mkdir: invalid path\n");
+		return;
+	}
+	
+	*last_slash = '\0';
+	const char *dirname = last_slash + 1;
+	const char *parent_path = path_copy[0] == '\0' ? "/" : path_copy;
+	
+	vfs_node_t *parent = vfs_resolve_path(parent_path);
+	if (!parent) {
+		printf("mkdir: cannot create directory '%s': No such file or directory\n", args);
+		return;
+	}
+	
+	if (vfs_mkdir(parent, dirname)) {
+		printf("Created directory '%s'\n", args);
+	} else {
+		printf("mkdir: cannot create directory '%s': File exists\n", args);
+	}
+}
+
+static void command_rmdir(const char* args) {
+	if (!args || strlen(args) == 0) {
+		printf("rmdir: missing operand\n");
+		printf("Usage: rmdir <directory>\n");
+		return;
+	}
+	
+	// Parse path to get parent and directory name
+	char path_copy[VFS_MAX_PATH_LEN];
+	strncpy(path_copy, args, VFS_MAX_PATH_LEN - 1);
+	path_copy[VFS_MAX_PATH_LEN - 1] = '\0';
+	
+	char *last_slash = strrchr(path_copy, '/');
+	if (!last_slash) {
+		printf("rmdir: invalid path\n");
+		return;
+	}
+	
+	*last_slash = '\0';
+	const char *dirname = last_slash + 1;
+	const char *parent_path = path_copy[0] == '\0' ? "/" : path_copy;
+	
+	vfs_node_t *parent = vfs_resolve_path(parent_path);
+	if (!parent) {
+		printf("rmdir: failed to remove '%s': No such file or directory\n", args);
+		return;
+	}
+	
+	vfs_node_t *dir = vfs_find_child(parent, dirname);
+	if (!dir) {
+		printf("rmdir: failed to remove '%s': No such file or directory\n", args);
+		return;
+	}
+	
+	if (dir->type != VFS_DIRECTORY) {
+		printf("rmdir: failed to remove '%s': Not a directory\n", args);
+		return;
+	}
+	
+	if (dir->child_count > 0) {
+		printf("rmdir: failed to remove '%s': Directory not empty\n", args);
+		return;
+	}
+	
+	if (vfs_delete(parent, dirname) == 0) {
+		printf("Removed directory '%s'\n", args);
+	} else {
+		printf("rmdir: failed to remove '%s'\n", args);
+	}
+}
+
+static void command_cd(const char* args) {
+	vfs_node_t *target;
+	
+	if (!args || strlen(args) == 0 || strcmp_local(args, "/") == 0) {
+		// Go to root
+		target = vfs_get_root();
+	} else if (strcmp_local(args, "..") == 0) {
+		// Go to parent directory
+		if (current_directory && current_directory->parent) {
+			target = current_directory->parent;
+		} else {
+			target = current_directory; // Already at root
+		}
+	} else if (strcmp_local(args, ".") == 0) {
+		// Stay in current directory
+		return;
+	} else {
+		// Resolve path (relative or absolute)
+		target = vfs_resolve_relative_path(args, current_directory);
+	}
+	
+	if (!target) {
+		printf("cd: %s: No such file or directory\n", args);
+		return;
+	}
+	
+	if (target->type != VFS_DIRECTORY) {
+		printf("cd: %s: Not a directory\n", args);
+		return;
+	}
+	
+	current_directory = target;
+}
+
+static void command_pwd(void) {
+	char path_buffer[VFS_MAX_PATH_LEN];
+	if (vfs_get_full_path(current_directory, path_buffer, VFS_MAX_PATH_LEN)) {
+		printf("%s\n", path_buffer);
+	} else {
+		printf("/\n");
+	}
+}
+
+// Graphics mode commands
+static void command_gfx(void) {
+	printf("Starting graphics demonstration...\n");
+	graphics_demo();
+}
+
+static void command_gfxanim(void) {
+	printf("Starting graphics animation...\n");
+	graphics_animation_demo();
+}
+
+static void command_gfxpaint(void) {
+	printf("Starting paint demo...\n");
+	graphics_paint_demo_with_dir(current_directory);
+}
+
+// Demo task functions
+static void demo_task_1(void) {
+	for (int i = 0; i < 10; i++) {
+		printf("[Task 1] Iteration %d\n", i);
+		timer_sleep_ms(500);
+	}
+	printf("[Task 1] Finished!\n");
+	task_exit();
+}
+
+static void demo_task_2(void) {
+	for (int i = 0; i < 8; i++) {
+		printf("[Task 2] Count: %d\n", i);
+		timer_sleep_ms(700);
+	}
+	printf("[Task 2] Done!\n");
+	task_exit();
+}
+
+static void demo_task_3(void) {
+	for (int i = 0; i < 5; i++) {
+		printf("[Task 3] Working... %d\n", i);
+		timer_sleep_ms(1000);
+	}
+	printf("[Task 3] Complete!\n");
+	task_exit();
+}
+
+// Process list command
+static void command_ps(void) {
+	task_list();
+}
+
+// Kill process command
+static void command_kill(const char* args) {
+	if (!args || strlen(args) == 0) {
+		printf("Usage: kill <pid>\n");
+		return;
+	}
+	
+	// Simple atoi implementation
+	uint32_t pid = 0;
+	while (*args >= '0' && *args <= '9') {
+		pid = pid * 10 + (*args - '0');
+		args++;
+	}
+	
+	if (pid == 0) {
+		printf("Invalid PID\n");
+		return;
+	}
+	
+	if (task_kill(pid)) {
+		printf("Task %u killed\n", pid);
+	} else {
+		printf("Task %u not found\n", pid);
+	}
+}
+
+// Spawn task command
+static void command_spawn(const char* args) {
+	if (!args || strlen(args) == 0) {
+		printf("Usage: spawn <demo1|demo2|demo3>\n");
+		return;
+	}
+	
+	task_t *task = NULL;
+	
+	if (strcmp(args, "demo1") == 0) {
+		task = task_create("Demo Task 1", demo_task_1, 1);
+	} else if (strcmp(args, "demo2") == 0) {
+		task = task_create("Demo Task 2", demo_task_2, 1);
+	} else if (strcmp(args, "demo3") == 0) {
+		task = task_create("Demo Task 3", demo_task_3, 1);
+	} else {
+		printf("Unknown task: %s\n", args);
+		printf("Available: demo1, demo2, demo3\n");
+		return;
+	}
+	
+	if (!task) {
+		printf("Failed to create task\n");
+	}
 }

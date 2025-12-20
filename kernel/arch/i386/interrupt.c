@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <kernel/interrupt.h>
 #include <kernel/pic.h>
-#include "io.c"
+#include <kernel/io.h>
 
 #include <stdint.h>
 #include <stddef.h> 

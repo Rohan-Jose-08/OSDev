@@ -2,12 +2,20 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <kernel/tty.h>
-#include "io.c"
+#include <kernel/io.h>
 
 #define KEYBOARD_DATA_PORT 0x60
 #define KEYBOARD_STATUS_PORT 0x64
 
 #define KEY_BUFFER_SIZE 256
+
+// Special key codes
+#define KEY_UP_ARROW 0x80
+#define KEY_DOWN_ARROW 0x81
+#define KEY_LEFT_ARROW 0x82
+#define KEY_RIGHT_ARROW 0x83
+#define KEY_PAGE_UP 0x84
+#define KEY_PAGE_DOWN 0x85
 
 static char key_buffer[KEY_BUFFER_SIZE];
 static int key_buffer_head = 0;
@@ -89,6 +97,7 @@ void keyboard_init(void) {
 
 void keyboard_handler(void) {
     uint8_t scancode = inb(KEYBOARD_DATA_PORT);
+    io_wait();
     
     // Check if key release (bit 7 set)
     if (scancode & 0x80) {
@@ -108,6 +117,40 @@ void keyboard_handler(void) {
         // Handle caps lock
         if (scancode == 0x3A) {
             caps_lock = !caps_lock;
+            return;
+        }
+        
+        // Handle arrow keys for history navigation
+        if (scancode == 0x48) { // Up arrow
+            int next_head = (key_buffer_head + 1) % KEY_BUFFER_SIZE;
+            if (next_head != key_buffer_tail) {
+                key_buffer[key_buffer_head] = KEY_UP_ARROW;
+                key_buffer_head = next_head;
+            }
+            return;
+        }
+        if (scancode == 0x50) { // Down arrow
+            int next_head = (key_buffer_head + 1) % KEY_BUFFER_SIZE;
+            if (next_head != key_buffer_tail) {
+                key_buffer[key_buffer_head] = KEY_DOWN_ARROW;
+                key_buffer_head = next_head;
+            }
+            return;
+        }
+        if (scancode == 0x4B) { // Left arrow
+            int next_head = (key_buffer_head + 1) % KEY_BUFFER_SIZE;
+            if (next_head != key_buffer_tail) {
+                key_buffer[key_buffer_head] = KEY_LEFT_ARROW;
+                key_buffer_head = next_head;
+            }
+            return;
+        }
+        if (scancode == 0x4D) { // Right arrow
+            int next_head = (key_buffer_head + 1) % KEY_BUFFER_SIZE;
+            if (next_head != key_buffer_tail) {
+                key_buffer[key_buffer_head] = KEY_RIGHT_ARROW;
+                key_buffer_head = next_head;
+            }
             return;
         }
         

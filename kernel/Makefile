@@ -30,6 +30,9 @@ $(ARCHDIR)/exception.o: $(ARCHDIR)/exception.S
 $(ARCHDIR)/irq.o: $(ARCHDIR)/irq.S
 	nasm -o $@ $(ASFLAGS) $<
 
+$(ARCHDIR)/context_switch.o: $(ARCHDIR)/context_switch.S
+	$(CC) -MD -c $< -o $@ $(CFLAGS) $(CPPFLAGS)
+
 $(ARCHDIR)/cpu.o: $(ARCHDIR)/cpu.S
 	$(CC) -MD -c $< -o $@ $(CFLAGS) $(CPPFLAGS)
 
@@ -39,6 +42,12 @@ $(KERNEL_ARCH_OBJS) \
 kernel/kernel.o \
 kernel/pic.o \
 kernel/shell.o \
+kernel/editor.o \
+kernel/vfs.o \
+kernel/snake.o \
+kernel/graphics_demo.o \
+kernel/paint.o \
+kernel/task.o \
 
 
 
