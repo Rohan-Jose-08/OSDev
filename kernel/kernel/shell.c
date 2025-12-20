@@ -5,6 +5,7 @@
 #include <kernel/tty.h>
 #include <kernel/keyboard.h>
 #include <kernel/cpu.h>
+#include <kernel/io.h>
 
 #define MAX_COMMAND_LENGTH 256
 
@@ -46,6 +47,18 @@ static unsigned int simple_rand(void) {
 	rand_seed = rand_seed * 1103515245 + 12345;
 	return (rand_seed / 65536) % 32768;
 }
+
+// Command handler types
+typedef void (*command_handler_t)(void);
+typedef void (*command_handler_arg_t)(const char*);
+
+// Command table entry
+typedef struct {
+	const char* name;
+	command_handler_t handler;
+	command_handler_arg_t handler_with_arg;
+	bool requires_arg;
+} command_entry_t;
 
 // Forward declarations
 static void output_prompt(void);
@@ -248,6 +261,7 @@ static void input_line(char* buffer, size_t max_length) {
 			}
 		} else if (c >= 32 && c < 127 && pos < max_length - 1) {
 			buffer[pos++] = c;
+			printf("%c", c);
 		}
 	}
 }
@@ -261,55 +275,85 @@ static void execute_command(const char* command) {
 		}
 	}
 	
-	if (strcmp_local(command, "help") == 0) command_help();
-	else if (strcmp_local(command, "clear") == 0) command_clear();
-	else if (strcmp_local(command, "about") == 0) command_about();
-	else if (strcmp_local(command, "banner") == 0) command_banner();
-	else if (strcmp_local(command, "colors") == 0) command_colors();
-	else if (strcmp_local(command, "sysinfo") == 0) command_sysinfo();
-	else if (strcmp_local(command, "uptime") == 0) command_uptime();
-	else if (strcmp_local(command, "guess") == 0) command_guess();
-	else if (strcmp_local(command, "art") == 0) command_art();
-	else if (strcmp_local(command, "rps") == 0) command_rps();
-	else if (strcmp_local(command, "history") == 0) command_history();
-	else if (strcmp_local(command, "halt") == 0) command_halt();
-	else if (strcmp_local(command, "randcolor") == 0) command_randcolor();
-	else if (strcmp_local(command, "tictactoe") == 0) command_tictactoe();
-	else if (strcmp_local(command, "hangman") == 0) command_hangman();
-	else if (strcmp_local(command, "aliases") == 0) command_aliases();
-	else if (strcmp_local(command, "fortune") == 0) command_fortune();
-	else if (strcmp_local(command, "beep") == 0) command_beep();
-	else if (strcmp_local(command, "matrix") == 0) command_matrix();
-	else if (strcmp_local(command, "cpuinfo") == 0) command_cpuinfo();
-	else if (strcmp_local(command, "rdtsc") == 0) command_rdtsc();
-	else if (strcmp_local(command, "regs") == 0) command_regs();
-	else if (strcmp_local(command, "benchmark") == 0) command_benchmark();
-	else if (starts_with(command, "echo ")) command_echo(command + 5);
-	else if (starts_with(command, "color ")) command_color(command + 6);
-	else if (starts_with(command, "calc ")) command_calc(command + 5);
-	else if (starts_with(command, "mem ")) command_memory(command + 4);
-	else if (starts_with(command, "reverse ")) command_reverse(command + 8);
-	else if (starts_with(command, "strlen ")) command_strlen(command + 7);
-	else if (starts_with(command, "upper ")) command_upper(command + 6);
-	else if (starts_with(command, "lower ")) command_lower(command + 6);
-	else if (starts_with(command, "rainbow ")) command_rainbow(command + 8);
-	else if (starts_with(command, "draw ")) command_draw(command + 5);
-	else if (starts_with(command, "timer ")) command_timer(command + 6);
-	else if (starts_with(command, "alias ")) command_alias(command + 6);
-	else if (starts_with(command, "unalias ")) command_unalias(command + 8);
-	else if (starts_with(command, "theme ")) command_theme(command + 6);
-	else if (starts_with(command, "animate ")) command_animate(command + 8);
-	else if (strcmp_local(command, "") != 0) {
+	// Command table - commands without arguments
+	static const command_entry_t command_table[] = {
+		{"help", command_help, NULL, false},
+		{"clear", command_clear, NULL, false},
+		{"about", command_about, NULL, false},
+		{"banner", command_banner, NULL, false},
+		{"colors", command_colors, NULL, false},
+		{"sysinfo", command_sysinfo, NULL, false},
+		{"uptime", command_uptime, NULL, false},
+		{"guess", command_guess, NULL, false},
+		{"art", command_art, NULL, false},
+		{"rps", command_rps, NULL, false},
+		{"history", command_history, NULL, false},
+		{"halt", command_halt, NULL, false},
+		{"randcolor", command_randcolor, NULL, false},
+		{"tictactoe", command_tictactoe, NULL, false},
+		{"hangman", command_hangman, NULL, false},
+		{"aliases", command_aliases, NULL, false},
+		{"fortune", command_fortune, NULL, false},
+		{"beep", command_beep, NULL, false},
+		{"matrix", command_matrix, NULL, false},
+		{"cpuinfo", command_cpuinfo, NULL, false},
+		{"rdtsc", command_rdtsc, NULL, false},
+		{"regs", command_regs, NULL, false},
+		{"benchmark", command_benchmark, NULL, false},
+		{"echo", NULL, command_echo, true},
+		{"color", NULL, command_color, true},
+		{"calc", NULL, command_calc, true},
+		{"mem", NULL, command_memory, true},
+		{"reverse", NULL, command_reverse, true},
+		{"strlen", NULL, command_strlen, true},
+		{"upper", NULL, command_upper, true},
+		{"lower", NULL, command_lower, true},
+		{"rainbow", NULL, command_rainbow, true},
+		{"draw", NULL, command_draw, true},
+		{"timer", NULL, command_timer, true},
+		{"alias", NULL, command_alias, true},
+		{"unalias", NULL, command_unalias, true},
+		{"theme", NULL, command_theme, true},
+		{"animate", NULL, command_animate, true},
+	};
+	
+	const int num_commands = sizeof(command_table) / sizeof(command_entry_t);
+	
+	// Try to find and execute command
+	for (int i = 0; i < num_commands; i++) {
+		const command_entry_t* cmd = &command_table[i];
+		size_t cmd_len = strlen(cmd->name);
+		
+		if (cmd->requires_arg) {
+			// Check if command matches with space after (has arguments)
+			if (starts_with(command, cmd->name) && 
+			    command[cmd_len] == ' ') {
+				cmd->handler_with_arg(command + cmd_len + 1);
+				return;
+			}
+			// Also match exact command name (no arguments - will show usage)
+			if (strcmp_local(command, cmd->name) == 0) {
+				cmd->handler_with_arg("");
+				return;
+			}
+		} else {
+			// Exact match for commands without arguments
+			if (strcmp_local(command, cmd->name) == 0) {
+				cmd->handler();
+				return;
+			}
+		}
+	}
+	
+	// Unknown command handling
+	if (strcmp_local(command, "") != 0) {
 		printf("Unknown command: %s\n", command);
 		
-		// Suggest similar commands
-		const char* commands[] = {"help", "clear", "about", "banner", "colors", "sysinfo", "uptime",
-			"guess", "art", "rps", "history", "halt", "randcolor", "tictactoe", "hangman", "aliases",
-			"fortune", "beep", "matrix"};
+		// Suggest similar commands using Levenshtein distance
 		int best_match = -1;
 		int best_distance = 999;
-		for (int i = 0; i < 19; i++) {
-			int dist = levenshtein_distance(command, commands[i]);
+		for (int i = 0; i < num_commands; i++) {
+			int dist = levenshtein_distance(command, command_table[i].name);
 			if (dist < best_distance && dist <= 2) {
 				best_distance = dist;
 				best_match = i;
@@ -317,7 +361,7 @@ static void execute_command(const char* command) {
 		}
 		
 		if (best_match >= 0) {
-			printf("Did you mean '%s'?\n", commands[best_match]);
+			printf("Did you mean '%s'?\n", command_table[best_match].name);
 		} else {
 			printf("Type 'help' for available commands.\n");
 		}
@@ -426,7 +470,7 @@ static void command_about(void) {
 	unsigned char old_color = terminal_getcolor();
 	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
 	printf("\n================================\n");
-	printf("  MyOS - Operating System\n");
+	printf("  RohanOS - Operating System\n");
 	printf("================================\n");
 	terminal_setcolor(old_color);
 	printf("\n");
@@ -1385,14 +1429,14 @@ static void command_animate(const char* args) {
 
 static void command_beep(void) {
 	// PC speaker control via port 0x61
-	unsigned char tmp = __builtin_ia32_inb(0x61);
+	unsigned char tmp = inb(0x61);
 	
 	// Enable speaker
-	__builtin_ia32_outb(0x61, tmp | 0x03);
+	outb(0x61, tmp | 0x03);
 	for (volatile int i = 0; i < 1000000; i++);
 	
 	// Disable speaker
-	__builtin_ia32_outb(0x61, tmp);
+	outb(0x61, tmp);
 	
 	printf("*BEEP*\n");
 }

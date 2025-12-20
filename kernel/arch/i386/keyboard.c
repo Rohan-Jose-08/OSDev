@@ -130,13 +130,6 @@ void keyboard_handler(void) {
                 if (next_head != key_buffer_tail) {
                     key_buffer[key_buffer_head] = ascii;
                     key_buffer_head = next_head;
-                    
-                    // Echo character to screen (except backspace)
-                    if (ascii == '\b') {
-                        terminal_putchar('\b');
-                    } else if (ascii != '\n') {
-                        terminal_putchar(ascii);
-                    }
                 }
             }
         }

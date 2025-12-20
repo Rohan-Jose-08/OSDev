@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <stdint.h>
-#include "arch/i386/io.c"
+#include <kernel/io.h>
 #include <kernel/pic.h>
 
 #define PIC1		0x20		/* IO base address for master PIC */

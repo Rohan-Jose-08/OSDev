@@ -8,4 +8,4 @@ void IRQ_set_mask(uint8_t IRQline);
 void IRQ_clear_mask(uint8_t IRQline);
 void pic_disable(void);
  
-#endif PIC_H
+#endif /* PIC_H */
