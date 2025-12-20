@@ -7,13 +7,18 @@
 #include <kernel/cpu.h>
 #include <kernel/io.h>
 #include <kernel/editor.h>
-#include <kernel/vfs.h>
 #include <kernel/mouse.h>
 #include <kernel/snake.h>
 #include <kernel/graphics_demo.h>
 #include <kernel/graphics.h>
 #include <kernel/task.h>
 #include <kernel/timer.h>
+#include <kernel/ata.h>
+#include <kernel/fs.h>
+#include <kernel/kmalloc.h>
+
+// Path length constant (previously from vfs.h)
+#define MAX_PATH_LEN 512
 
 
 #define MAX_COMMAND_LENGTH 256
@@ -50,8 +55,8 @@ static int alias_count = 0;
 // Current color theme
 static int current_theme = 0;
 
-// Current working directory
-static vfs_node_t *current_directory = NULL;
+// Current working directory (for disk filesystem)
+static char current_dir_path[256] = "/";
 
 // Simple pseudo-random number generator
 static unsigned int rand_seed = 12345;
@@ -124,6 +129,7 @@ static void command_ls(const char* args);
 static void command_cat(const char* args);
 static void command_rm(const char* args);
 static void command_touch(const char* args);
+static void command_write(const char* args);
 static void command_mkdir(const char* args);
 static void command_rmdir(const char* args);
 static void command_cd(const char* args);
@@ -131,6 +137,11 @@ static void command_pwd(void);
 static void command_ps(void);
 static void command_kill(const char* args);
 static void command_spawn(const char* args);
+static void command_diskfmt(const char* args);
+static void command_diskmount(const char* args);
+static void command_diskls(const char* args);
+static void command_diskwrite(const char* args);
+static void command_diskread(const char* args);
 
 static int strcmp_local(const char* s1, const char* s2) {
 	while (*s1 && (*s1 == *s2)) { s1++; s2++; }
@@ -211,7 +222,7 @@ void shell_init(void) {
 	char command[MAX_COMMAND_LENGTH];
 	
 	// Initialize current directory to root
-	current_directory = vfs_get_root();
+	strcpy(current_dir_path, "/");
 	
 	command_banner();
 	
@@ -241,13 +252,7 @@ void shell_init(void) {
 }
 
 static void output_prompt(void) {
-	char path[VFS_MAX_PATH_LEN];
-	
-	if (current_directory && vfs_get_full_path(current_directory, path, sizeof(path))) {
-		printf("myos:%s> ", path);
-	} else {
-		printf("myos> ");
-	}
+	printf("myos:%s> ", current_dir_path);
 }
 
 static void input_line(char* buffer, size_t max_length) {
@@ -463,6 +468,7 @@ static void execute_command(const char* command) {
 		{"cat", NULL, command_cat, true},
 		{"rm", NULL, command_rm, true},
 		{"touch", NULL, command_touch, true},
+		{"write", NULL, command_write, true},
 		{"mkdir", NULL, command_mkdir, true},
 		{"rmdir", NULL, command_rmdir, true},
 		{"cd", NULL, command_cd, true},
@@ -470,6 +476,11 @@ static void execute_command(const char* command) {
 		{"ps", command_ps, NULL, false},
 		{"kill", NULL, command_kill, true},
 		{"spawn", NULL, command_spawn, true},
+		{"diskfmt", NULL, command_diskfmt, true},
+		{"diskmount", NULL, command_diskmount, true},
+		{"diskls", NULL, command_diskls, true},
+		{"diskwrite", NULL, command_diskwrite, true},
+		{"diskread", NULL, command_diskread, true},
 	};
 	
 	const int num_commands = sizeof(command_table) / sizeof(command_entry_t);
@@ -576,7 +587,7 @@ static void command_help(void) {
 	terminal_setcolor(old_color);
 	printf("  calc <expr>   - Simple calculator (e.g., calc 5 + 3)\n");
 	printf("  reverse <text> - Reverse text string\n");
-	printf("  mem <addr>    - View memory (hex address, e.g., mem 0xB8000)\n");
+	printf("  mem [addr]    - View heap stats or memory (e.g., mem or mem 0xB8000)\n");
 	
 	printf("\n");
 	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
@@ -626,6 +637,7 @@ static void command_help(void) {
 	printf("  ls [path]     - List directory contents\n");
 	printf("  cat <file>    - Display file contents\n");
 	printf("  touch <file>  - Create empty file\n");
+	printf("  write <file> <text> - Write text to file\n");
 	printf("  rm <file>     - Delete file\n");
 	printf("  mkdir <dir>   - Create directory\n");
 	printf("  rmdir <dir>   - Remove empty directory\n");
@@ -639,6 +651,16 @@ static void command_help(void) {
 	printf("  ps            - List running tasks/processes\n");
 	printf("  spawn <task>  - Create new task (demo1, demo2, demo3)\n");
 	printf("  kill <pid>    - Terminate task by PID\n");
+	
+	printf("\n");
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+	printf("Persistent Storage:\n");
+	terminal_setcolor(old_color);
+	printf("  diskfmt <n>   - Format disk drive (0-3)\n");
+	printf("  diskmount <n> - Mount disk filesystem\n");
+	printf("  diskls        - List files on disk\n");
+	printf("  diskwrite <f> - Write file to disk\n");
+	printf("  diskread <f>  - Read file from disk\n");
 	
 	printf("\n");
 	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
@@ -905,6 +927,18 @@ static void command_uptime(void) {
 static void command_memory(const char* args) {
 	while (*args == ' ') args++;
 	
+	// If no args or "heap", show heap statistics
+	if (*args == '\0' || strcmp(args, "heap") == 0) {
+		unsigned char old_color = terminal_getcolor();
+		terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
+		printf("\n");
+		terminal_setcolor(old_color);
+		kmalloc_print_stats();
+		printf("\n");
+		return;
+	}
+	
+	// Otherwise show memory dump at address
 	unsigned int addr = parse_hex(args);
 	unsigned char* mem = (unsigned char*)addr;
 	
@@ -1843,34 +1877,18 @@ static void command_edit(const char* args) {
 	}
 	
 	// Build absolute path if needed
-	char abs_path[VFS_MAX_PATH_LEN];
+	char abs_path[MAX_PATH_LEN];
 	if (args[0] == '/') {
 		// Already absolute
-		strncpy(abs_path, args, VFS_MAX_PATH_LEN - 1);
-		abs_path[VFS_MAX_PATH_LEN - 1] = '\0';
+		strncpy(abs_path, args, MAX_PATH_LEN - 1);
+		abs_path[MAX_PATH_LEN - 1] = '\0';
 	} else {
 		// Build absolute path from current directory
-		if (!current_directory || !vfs_get_full_path(current_directory, abs_path, sizeof(abs_path))) {
-			printf("edit: cannot determine current directory\n");
-			return;
+		if (strcmp(current_dir_path, "/") == 0) {
+			snprintf(abs_path, sizeof(abs_path), "/%s", args);
+		} else {
+			snprintf(abs_path, sizeof(abs_path), "%s/%s", current_dir_path, args);
 		}
-		
-		size_t abs_len = strlen(abs_path);
-		if (abs_len > 0 && abs_path[abs_len - 1] != '/') {
-			if (abs_len + 1 >= VFS_MAX_PATH_LEN) {
-				printf("edit: path too long\n");
-				return;
-			}
-			abs_path[abs_len++] = '/';
-			abs_path[abs_len] = '\0';
-		}
-		
-		if (abs_len + strlen(args) >= VFS_MAX_PATH_LEN) {
-			printf("edit: path too long\n");
-			return;
-		}
-		
-		strcat(abs_path, args);
 	}
 	
 	editor_run(abs_path);
@@ -1939,46 +1957,60 @@ static void command_display(const char* args) {
 	}
 }
 
-// VFS command implementations
+// File command implementations (using disk filesystem)
 static void command_ls(const char* args) {
-	vfs_node_t *dir;
-	
-	
-	if (args && strlen(args) > 0) {
-		dir = vfs_resolve_relative_path(args, current_directory);
-		if (!dir) {
-			printf("ls: cannot access '%s': No such file or directory\n", args);
-			return;
-		}
-	} else {
-		dir = current_directory;
-		if (!dir) {
-			printf("ls: current directory not set\n");
-			return;
-		}
-	}
-	
-	if (dir->type != VFS_DIRECTORY) {
-		printf("ls: Not a directory\n");
+	fs_context_t *fs = fs_get_context();
+	if (!fs || !fs->mounted) {
+		printf("ls: filesystem not mounted\n");
 		return;
 	}
 	
-	vfs_node_t *children[VFS_MAX_CHILDREN];
-	int count = vfs_list_dir(dir, children, VFS_MAX_CHILDREN);
+	// Determine which directory to list
+	const char *list_path = current_dir_path;
+	if (args && strlen(args) > 0) {
+		// Build absolute path if relative
+		if (args[0] == '/') {
+			list_path = args;
+		} else {
+			static char full_path[256];
+			if (strcmp(current_dir_path, "/") == 0) {
+				snprintf(full_path, sizeof(full_path), "/%s", args);
+			} else {
+				snprintf(full_path, sizeof(full_path), "%s/%s", current_dir_path, args);
+			}
+			list_path = full_path;
+		}
+	}
 	
+	fs_dirent_t entries[64];
+	int count = fs_list_dir(list_path, entries, 64);
 	
-	if (count <= 0) {
+	if (count < 0) {
+		printf("ls: cannot access '%s': No such file or directory\n", list_path);
+		return;
+	}
+	
+	if (count == 0) {
+		printf("(empty)\n");
 		return;
 	}
 	
 	for (int i = 0; i < count; i++) {
-		if (!children[i]) {
-			continue;
-		}
-		if (children[i]->type == VFS_DIRECTORY) {
-			printf("[DIR]  %s\n", children[i]->name);
+		// Build full path for stat
+		char entry_path[256];
+		if (strcmp(list_path, "/") == 0) {
+			snprintf(entry_path, sizeof(entry_path), "/%s", entries[i].name);
 		} else {
-			printf("[FILE] %s (%u bytes)\n", children[i]->name, children[i]->size);
+			snprintf(entry_path, sizeof(entry_path), "%s/%s", list_path, entries[i].name);
+		}
+		
+		fs_inode_t inode;
+		if (fs_stat(entry_path, &inode)) {
+			if (inode.type == 2) {  // Directory
+				printf("[DIR]  %s\n", entries[i].name);
+			} else {
+				printf("[FILE] %s (%u bytes)\n", entries[i].name, inode.size);
+			}
 		}
 	}
 }
@@ -1990,11 +2022,33 @@ static void command_cat(const char* args) {
 		return;
 	}
 	
+	fs_context_t *fs = fs_get_context();
+	if (!fs || !fs->mounted) {
+		printf("cat: filesystem not mounted\n");
+		return;
+	}
+	
+	// Build full path
+	static char full_path[256];
+	if (args[0] == '/') {
+		strncpy(full_path, args, sizeof(full_path) - 1);
+	} else {
+		if (strcmp(current_dir_path, "/") == 0) {
+			snprintf(full_path, sizeof(full_path), "/%s", args);
+		} else {
+			snprintf(full_path, sizeof(full_path), "%s/%s", current_dir_path, args);
+		}
+	}
+	
 	uint8_t buffer[4096];
-	int bytes_read = vfs_read_path_relative(args, current_directory, buffer, sizeof(buffer) - 1, 0);
+	int bytes_read = fs_read_file(full_path, buffer, sizeof(buffer) - 1, 0);
 	
 	if (bytes_read < 0) {
 		printf("cat: %s: No such file or directory\n", args);
+		return;
+	}
+	
+	if (bytes_read == 0) {
 		return;
 	}
 	
@@ -2009,28 +2063,25 @@ static void command_rm(const char* args) {
 		return;
 	}
 	
-	// Parse path to get parent and filename
-	char path_copy[VFS_MAX_PATH_LEN];
-	strncpy(path_copy, args, VFS_MAX_PATH_LEN - 1);
-	path_copy[VFS_MAX_PATH_LEN - 1] = '\0';
-	
-	char *last_slash = strrchr(path_copy, '/');
-	if (!last_slash) {
-		printf("rm: invalid path\n");
+	fs_context_t *fs = fs_get_context();
+	if (!fs || !fs->mounted) {
+		printf("rm: filesystem not mounted\n");
 		return;
 	}
 	
-	*last_slash = '\0';
-	const char *filename = last_slash + 1;
-	const char *dir_path = path_copy[0] == '\0' ? "/" : path_copy;
-	
-	vfs_node_t *parent = vfs_resolve_path(dir_path);
-	if (!parent) {
-		printf("rm: cannot remove '%s': No such file or directory\n", args);
-		return;
+	// Build full path
+	static char full_path[256];
+	if (args[0] == '/') {
+		strncpy(full_path, args, sizeof(full_path) - 1);
+	} else {
+		if (strcmp(current_dir_path, "/") == 0) {
+			snprintf(full_path, sizeof(full_path), "/%s", args);
+		} else {
+			snprintf(full_path, sizeof(full_path), "%s/%s", current_dir_path, args);
+		}
 	}
 	
-	if (vfs_delete(parent, filename) == 0) {
+	if (fs_delete(full_path)) {
 		printf("Removed '%s'\n", args);
 	} else {
 		printf("rm: cannot remove '%s': No such file or directory\n", args);
@@ -2044,149 +2095,178 @@ static void command_touch(const char* args) {
 		return;
 	}
 	
-	// Check if file already exists
-	vfs_node_t *existing = vfs_resolve_relative_path(args, current_directory);
-	if (existing) {
-		printf("File '%s' already exists\n", args);
+	fs_context_t *fs = fs_get_context();
+	if (!fs || !fs->mounted) {
+		printf("touch: filesystem not mounted\n");
 		return;
 	}
 	
-	// Create empty file
-	const uint8_t empty[] = "";
-	if (vfs_write_path_relative(args, current_directory, empty, 0) >= 0) {
-		printf("Created file '%s'\n", args);
+	// Build full path
+	static char full_path[256];
+	if (args[0] == '/') {
+		strncpy(full_path, args, sizeof(full_path) - 1);
 	} else {
-		printf("touch: cannot create '%s': No such file or directory\n", args);
+		if (strcmp(current_dir_path, "/") == 0) {
+			snprintf(full_path, sizeof(full_path), "/%s", args);
+		} else {
+			snprintf(full_path, sizeof(full_path), "%s/%s", current_dir_path, args);
+		}
+	}
+	
+	int result = fs_create_file(full_path);
+	if (result >= 0) {
+		printf("Created file '%s'\n", args);
+	} else if (result == -2) {
+		printf("File '%s' already exists\n", args);
+	} else {
+		printf("touch: cannot create '%s'\n", args);
+	}
+}
+
+// Write command - easier than diskwrite
+static void command_write(const char* args) {
+	if (!args || strlen(args) == 0) {
+		printf("Usage: write <filename> <content>\n");
+		return;
+	}
+	
+	fs_context_t *fs = fs_get_context();
+	if (!fs || !fs->mounted) {
+		printf("write: filesystem not mounted\n");
+		return;
+	}
+	
+	// Parse filename
+	char filename[32];
+	int i = 0;
+	while (*args && *args != ' ' && i < 31) {
+		filename[i++] = *args++;
+	}
+	filename[i] = '\0';
+	
+	// Skip spaces
+	while (*args == ' ') args++;
+	
+	if (*args == '\0') {
+		printf("Usage: write <filename> <content>\n");
+		return;
+	}
+	
+	// Build full path
+	static char full_path[256];
+	if (filename[0] == '/') {
+		strncpy(full_path, filename, sizeof(full_path) - 1);
+	} else {
+		if (strcmp(current_dir_path, "/") == 0) {
+			snprintf(full_path, sizeof(full_path), "/%s", filename);
+		} else {
+			snprintf(full_path, sizeof(full_path), "%s/%s", current_dir_path, filename);
+		}
+	}
+	
+	// Create file (or use existing)
+	int result = fs_create_file(full_path);
+	if (result < 0 && result != -2) {
+		printf("write: cannot create file\n");
+		return;
+	}
+	
+	// Write content
+	result = fs_write_file(full_path, (const uint8_t*)args, strlen(args), 0);
+	if (result > 0) {
+		printf("Wrote %d bytes to %s\n", result, filename);
+	} else {
+		printf("write: write failed\n");
 	}
 }
 
 static void command_mkdir(const char* args) {
 	if (!args || strlen(args) == 0) {
-		printf("mkdir: missing operand\n");
 		printf("Usage: mkdir <directory>\n");
 		return;
 	}
 	
-	// Parse path to get parent and directory name
-	char path_copy[VFS_MAX_PATH_LEN];
-	strncpy(path_copy, args, VFS_MAX_PATH_LEN - 1);
-	path_copy[VFS_MAX_PATH_LEN - 1] = '\0';
-	
-	char *last_slash = strrchr(path_copy, '/');
-	if (!last_slash) {
-		printf("mkdir: invalid path\n");
-		return;
-	}
-	
-	*last_slash = '\0';
-	const char *dirname = last_slash + 1;
-	const char *parent_path = path_copy[0] == '\0' ? "/" : path_copy;
-	
-	vfs_node_t *parent = vfs_resolve_path(parent_path);
-	if (!parent) {
-		printf("mkdir: cannot create directory '%s': No such file or directory\n", args);
-		return;
-	}
-	
-	if (vfs_mkdir(parent, dirname)) {
-		printf("Created directory '%s'\n", args);
+	char full_path[256];
+	if (args[0] == '/') {
+		strncpy(full_path, args, sizeof(full_path) - 1);
+		full_path[sizeof(full_path) - 1] = '\0';
 	} else {
-		printf("mkdir: cannot create directory '%s': File exists\n", args);
+		if (strcmp(current_dir_path, "/") == 0) {
+			snprintf(full_path, sizeof(full_path), "/%s", args);
+		} else {
+			snprintf(full_path, sizeof(full_path), "%s/%s", current_dir_path, args);
+		}
+	}
+	
+	int result = fs_create_dir(full_path);
+	if (result < 0) {
+		printf("mkdir: failed to create directory '%s'\n", full_path);
+	} else {
+		printf("Created directory: %s\n", full_path);
 	}
 }
 
 static void command_rmdir(const char* args) {
-	if (!args || strlen(args) == 0) {
-		printf("rmdir: missing operand\n");
-		printf("Usage: rmdir <directory>\n");
-		return;
-	}
-	
-	// Parse path to get parent and directory name
-	char path_copy[VFS_MAX_PATH_LEN];
-	strncpy(path_copy, args, VFS_MAX_PATH_LEN - 1);
-	path_copy[VFS_MAX_PATH_LEN - 1] = '\0';
-	
-	char *last_slash = strrchr(path_copy, '/');
-	if (!last_slash) {
-		printf("rmdir: invalid path\n");
-		return;
-	}
-	
-	*last_slash = '\0';
-	const char *dirname = last_slash + 1;
-	const char *parent_path = path_copy[0] == '\0' ? "/" : path_copy;
-	
-	vfs_node_t *parent = vfs_resolve_path(parent_path);
-	if (!parent) {
-		printf("rmdir: failed to remove '%s': No such file or directory\n", args);
-		return;
-	}
-	
-	vfs_node_t *dir = vfs_find_child(parent, dirname);
-	if (!dir) {
-		printf("rmdir: failed to remove '%s': No such file or directory\n", args);
-		return;
-	}
-	
-	if (dir->type != VFS_DIRECTORY) {
-		printf("rmdir: failed to remove '%s': Not a directory\n", args);
-		return;
-	}
-	
-	if (dir->child_count > 0) {
-		printf("rmdir: failed to remove '%s': Directory not empty\n", args);
-		return;
-	}
-	
-	if (vfs_delete(parent, dirname) == 0) {
-		printf("Removed directory '%s'\n", args);
-	} else {
-		printf("rmdir: failed to remove '%s'\n", args);
-	}
+	printf("rmdir: directories not yet supported (flat filesystem)\\n");
 }
 
 static void command_cd(const char* args) {
-	vfs_node_t *target;
+	if (!args || strlen(args) == 0) {
+		// cd with no args goes to root
+		strcpy(current_dir_path, "/");
+		return;
+	}
 	
-	if (!args || strlen(args) == 0 || strcmp_local(args, "/") == 0) {
-		// Go to root
-		target = vfs_get_root();
-	} else if (strcmp_local(args, "..") == 0) {
-		// Go to parent directory
-		if (current_directory && current_directory->parent) {
-			target = current_directory->parent;
-		} else {
-			target = current_directory; // Already at root
-		}
-	} else if (strcmp_local(args, ".") == 0) {
+	// Handle special cases
+	if (strcmp(args, ".") == 0) {
 		// Stay in current directory
 		return;
+	}
+	
+	if (strcmp(args, "..") == 0) {
+		// Go to parent directory
+		if (strcmp(current_dir_path, "/") == 0) {
+			// Already at root
+			return;
+		}
+		// Find last slash and truncate
+		char *last_slash = strrchr(current_dir_path, '/');
+		if (last_slash && last_slash != current_dir_path) {
+			*last_slash = '\0';
+		} else {
+			strcpy(current_dir_path, "/");
+		}
+		return;
+	}
+	
+	// Build full path
+	char new_path[256];
+	if (args[0] == '/') {
+		strncpy(new_path, args, sizeof(new_path) - 1);
+		new_path[sizeof(new_path) - 1] = '\0';
 	} else {
-		// Resolve path (relative or absolute)
-		target = vfs_resolve_relative_path(args, current_directory);
+		if (strcmp(current_dir_path, "/") == 0) {
+			snprintf(new_path, sizeof(new_path), "/%s", args);
+		} else {
+			snprintf(new_path, sizeof(new_path), "%s/%s", current_dir_path, args);
+		}
 	}
 	
-	if (!target) {
-		printf("cd: %s: No such file or directory\n", args);
+	// Verify directory exists by trying to list it
+	fs_dirent_t entries[1];
+	int count = fs_list_dir(new_path, entries, 1);
+	if (count < 0) {
+		printf("cd: directory not found: %s\n", new_path);
 		return;
 	}
 	
-	if (target->type != VFS_DIRECTORY) {
-		printf("cd: %s: Not a directory\n", args);
-		return;
-	}
-	
-	current_directory = target;
+	// Change directory
+	strncpy(current_dir_path, new_path, sizeof(current_dir_path) - 1);
+	current_dir_path[sizeof(current_dir_path) - 1] = '\0';
 }
 
 static void command_pwd(void) {
-	char path_buffer[VFS_MAX_PATH_LEN];
-	if (vfs_get_full_path(current_directory, path_buffer, VFS_MAX_PATH_LEN)) {
-		printf("%s\n", path_buffer);
-	} else {
-		printf("/\n");
-	}
+	printf("%s\n", current_dir_path);
 }
 
 // Graphics mode commands
@@ -2202,7 +2282,7 @@ static void command_gfxanim(void) {
 
 static void command_gfxpaint(void) {
 	printf("Starting paint demo...\n");
-	graphics_paint_demo_with_dir(current_directory);
+	graphics_paint_demo_with_dir(current_dir_path);
 }
 
 // Demo task functions
@@ -2289,3 +2369,172 @@ static void command_spawn(const char* args) {
 		printf("Failed to create task\n");
 	}
 }
+
+// Format disk command
+static void command_diskfmt(const char* args) {
+	if (!args || strlen(args) == 0) {
+		printf("Usage: diskfmt <drive_number>\n");
+		printf("Warning: This will erase all data on the drive!\n");
+		return;
+	}
+	
+	uint8_t drive = 0;
+	while (*args >= '0' && *args <= '9') {
+		drive = drive * 10 + (*args - '0');
+		args++;
+	}
+	
+	if (drive >= 4) {
+		printf("Invalid drive number (0-3)\n");
+		return;
+	}
+	
+	ata_device_t *dev = ata_get_device(drive);
+	if (!dev) {
+		printf("Drive %u not found\n", drive);
+		return;
+	}
+	
+	printf("Formatting drive %u...\n", drive);
+	if (fs_format(drive)) {
+		printf("Format complete!\n");
+	} else {
+		printf("Format failed\n");
+	}
+}
+
+// Mount disk command
+static void command_diskmount(const char* args) {
+	if (!args || strlen(args) == 0) {
+		printf("Usage: diskmount <drive_number>\n");
+		return;
+	}
+	
+	uint8_t drive = 0;
+	while (*args >= '0' && *args <= '9') {
+		drive = drive * 10 + (*args - '0');
+		args++;
+	}
+	
+	if (drive >= 4) {
+		printf("Invalid drive number (0-3)\n");
+		return;
+	}
+	
+	ata_device_t *dev = ata_get_device(drive);
+	if (!dev) {
+		printf("Drive %u not found\n", drive);
+		return;
+	}
+	
+	if (fs_mount(drive)) {
+		printf("Mounted drive %u\n", drive);
+	} else {
+		printf("Mount failed. Try formatting with diskfmt first.\n");
+	}
+}
+
+// List disk files command
+static void command_diskls(const char* args) {
+	fs_context_t *fs = fs_get_context();
+	if (!fs || !fs->mounted) {
+		printf("No filesystem mounted. Use diskmount first.\n");
+		return;
+	}
+	
+	fs_dirent_t entries[32];
+	int count = fs_list_dir("/", entries, 32);
+	
+	if (count < 0) {
+		printf("Failed to list directory\n");
+		return;
+	}
+	
+	if (count == 0) {
+		printf("No files found\n");
+		return;
+	}
+	
+	printf("Files on disk:\n");
+	for (int i = 0; i < count; i++) {
+		printf("  %s\n", entries[i].name);
+	}
+}
+
+// Write file to disk command
+static void command_diskwrite(const char* args) {
+	if (!args || strlen(args) == 0) {
+		printf("Usage: diskwrite <filename> <content>\n");
+		return;
+	}
+	
+	fs_context_t *fs = fs_get_context();
+	if (!fs || !fs->mounted) {
+		printf("No filesystem mounted. Use diskmount first.\n");
+		return;
+	}
+	
+	// Parse filename
+	char filename[32];
+	int i = 0;
+	while (*args && *args != ' ' && i < 31) {
+		filename[i++] = *args++;
+	}
+	filename[i] = '\0';
+	
+	// Skip spaces
+	while (*args == ' ') args++;
+	
+	if (*args == '\0') {
+		printf("Usage: diskwrite <filename> <content>\n");
+		return;
+	}
+	
+	// Create file
+	int result = fs_create_file(filename);
+	if (result < 0 && result != -2) {
+		printf("Failed to create file\n");
+		return;
+	}
+	
+	// Write content
+	result = fs_write_file(filename, (const uint8_t*)args, strlen(args), 0);
+	if (result > 0) {
+		printf("Wrote %d bytes to %s\n", result, filename);
+	} else {
+		printf("Write failed\n");
+	}
+}
+
+// Read file from disk command
+static void command_diskread(const char* args) {
+	if (!args || strlen(args) == 0) {
+		printf("Usage: diskread <filename>\n");
+		return;
+	}
+	
+	fs_context_t *fs = fs_get_context();
+	if (!fs || !fs->mounted) {
+		printf("No filesystem mounted. Use diskmount first.\n");
+		return;
+	}
+	
+	uint8_t buffer[512];
+	int bytes_read = fs_read_file(args, buffer, sizeof(buffer) - 1, 0);
+	
+	if (bytes_read < 0) {
+		printf("File not found or read error\n");
+		return;
+	}
+	
+	if (bytes_read == 0) {
+		printf("File is empty\n");
+		return;
+	}
+	
+	buffer[bytes_read] = '\0';
+	printf("%s\n", buffer);
+}
+
+
+

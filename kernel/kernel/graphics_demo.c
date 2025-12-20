@@ -285,12 +285,12 @@ void graphics_paint_demo(void) {
 }
 
 // Paint demo with directory context
-void graphics_paint_demo_with_dir(vfs_node_t *current_dir) {
+void graphics_paint_demo_with_dir(const char *current_dir_path) {
     if (!graphics_set_mode(MODE_13H)) {
         printf("Failed to set graphics mode!\n");
         return;
     }
     
-    paint_program(current_dir);
+    paint_program(current_dir_path);
     graphics_return_to_text();
 }

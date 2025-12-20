@@ -43,11 +43,12 @@ kernel/kernel.o \
 kernel/pic.o \
 kernel/shell.o \
 kernel/editor.o \
-kernel/vfs.o \
 kernel/snake.o \
 kernel/graphics_demo.o \
 kernel/paint.o \
 kernel/task.o \
+kernel/fs.o \
+kernel/kmalloc.o \
 
 
 

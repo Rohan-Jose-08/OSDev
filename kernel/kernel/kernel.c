@@ -7,10 +7,12 @@
 #include <kernel/keyboard.h>
 #include <kernel/mouse.h>
 #include <kernel/shell.h>
-#include <kernel/vfs.h>
 #include <kernel/graphics.h>
 #include <kernel/timer.h>
 #include <kernel/task.h>
+#include <kernel/ata.h>
+#include <kernel/fs.h>
+#include <kernel/kmalloc.h>
 
 #include <stdint.h>
 #include <stddef.h> 
@@ -29,14 +31,17 @@ void kernel_main(void) {
 
 	terminal_initialize();
     
+    // Initialize kernel heap early
+    kmalloc_init();
     
 	idt_init();
     timer_init(100); // Initialize timer at 100 Hz (10ms per tick)
     scheduler_init(); // Initialize task scheduler
     keyboard_init();
     mouse_init();
-    vfs_init();
     graphics_init();
+    ata_init();
+    fs_init();
 
     
 
@@ -46,22 +51,33 @@ void kernel_main(void) {
     printf("Keyboard initialized.\n");
     printf("Mouse initialized. (Scroll to navigate history)\n");
     
-    // Create some test directories and files in VFS
-    vfs_node_t *root = vfs_get_root();
-    vfs_mkdir(root, "home");
-    vfs_mkdir(root, "bin");
-    vfs_mkdir(root, "etc");
-    
-    vfs_node_t *home = vfs_find_child(root, "home");
-    if (home) {
-        vfs_node_t *user_dir = vfs_mkdir(home, "user");
-        if (user_dir) {
-            vfs_node_t *test_file = vfs_create_file(user_dir, "readme.txt", VFS_PERM_READ | VFS_PERM_WRITE);
-            if (test_file) {
-                const char *content = "Welcome to RohanOS Virtual File System!";
-                vfs_write_file(test_file, (const uint8_t*)content, strlen(content));
+    // Auto-mount primary disk (drive 0)
+    printf("Mounting disk filesystem...\n");
+    ata_device_t *drive = ata_get_device(0);
+    if (drive) {
+        // Try to mount existing filesystem
+        if (!fs_mount(0)) {
+            // If mount fails, format and mount
+            printf("No filesystem found. Formatting disk...\n");
+            if (fs_format(0)) {
+                if (fs_mount(0)) {
+                    printf("Disk formatted and mounted successfully!\n");
+                    
+                    // Create a welcome file
+                    fs_create_file("welcome.txt");
+                    const char *welcome = "Welcome to RohanOS!\n\nYour files are now stored on disk and will persist between reboots.\n\nTry these commands:\n  ls - list files\n  cat welcome.txt - read this file\n  write <file> <text> - create a file\n  rm <file> - delete a file\n";
+                    fs_write_file("welcome.txt", (const uint8_t*)welcome, strlen(welcome), 0);
+                } else {
+                    printf("Failed to mount after format\n");
+                }
+            } else {
+                printf("Failed to format disk\n");
             }
+        } else {
+            printf("Disk mounted successfully!\n");
         }
+    } else {
+        printf("Warning: No disk drive detected. File operations will be limited.\n");
     }
     
 

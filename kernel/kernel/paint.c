@@ -2,7 +2,7 @@
 #include <kernel/graphics.h>
 #include <kernel/keyboard.h>
 #include <kernel/mouse.h>
-#include <kernel/vfs.h>
+#include <kernel/fs.h>
 #include <kernel/tty.h>
 #include <stdio.h>
 #include <string.h>
@@ -50,9 +50,9 @@ static int save_canvas_bmp(const uint8_t *canvas, int width, int height, const c
     int palette_size = 256 * 4;  // 256 colors * 4 bytes per color
     int file_size = sizeof(bmp_file_header_t) + sizeof(bmp_info_header_t) + palette_size + pixel_data_size;
     
-    // Allocate buffer for entire BMP file
-    uint8_t *bmp_data = (uint8_t*)vfs_malloc(file_size);
-    if (!bmp_data) {
+    // Allocate buffer for entire BMP file (using static buffer to avoid malloc)
+    static uint8_t bmp_data[65536];  // 64KB max
+    if (file_size > sizeof(bmp_data)) {
         return -1;
     }
     
@@ -97,8 +97,11 @@ static int save_canvas_bmp(const uint8_t *canvas, int width, int height, const c
         }
     }
     
-    // Write to VFS
-    int result = vfs_write_path(filename, bmp_data, file_size);
+    // Write to disk filesystem
+    // First create the file (ignore error if it already exists)
+    fs_create_file(filename);
+    
+    int result = fs_write_file(filename, bmp_data, file_size, 0);
     
     return result;
 }
@@ -147,7 +150,7 @@ static void input_filename(char *buffer, int max_len, int x, int y) {
 static int load_canvas_bmp(uint8_t *canvas, int width, int height, const char *filename) {
     // First, get the file size by reading the file header
     bmp_file_header_t file_header;
-    if (vfs_read_path(filename, (uint8_t*)&file_header, sizeof(file_header), 0) < 0) {
+    if (fs_read_file(filename, (uint8_t*)&file_header, sizeof(file_header), 0) < 0) {
         return -1;  // File not found or read error
     }
     
@@ -156,14 +159,14 @@ static int load_canvas_bmp(uint8_t *canvas, int width, int height, const char *f
         return -2;  // Not a valid BMP file
     }
     
-    // Allocate buffer for entire BMP file
-    uint8_t *bmp_data = (uint8_t*)vfs_malloc(file_header.size);
-    if (!bmp_data) {
-        return -3;  // Out of memory
+    // Allocate buffer for entire BMP file (using static buffer)
+    static uint8_t bmp_data[65536];  // 64KB max
+    if (file_header.size > sizeof(bmp_data)) {
+        return -3;  // File too large
     }
     
     // Read entire file
-    if (vfs_read_path(filename, bmp_data, file_header.size, 0) < 0) {
+    if (fs_read_file(filename, bmp_data, file_header.size, 0) < 0) {
         return -4;  // Read error
     }
     
@@ -194,7 +197,7 @@ static int load_canvas_bmp(uint8_t *canvas, int width, int height, const char *f
 }
 
 // Mouse-based paint program (like MS Paint)
-void paint_program(vfs_node_t *current_dir) {
+void paint_program(const char *current_dir_path) {
     graphics_clear(COLOR_BLACK);
     
     // Absolute cursor position (not delta)
@@ -295,18 +298,15 @@ void paint_program(vfs_node_t *current_dir) {
                 }
                 
                 // Construct full path
-                char full_path[VFS_MAX_PATH_LEN];
+                char full_path[256];
                 if (filename[0] == '/') {
                     strncpy(full_path, filename, sizeof(full_path));
-                } else if (current_dir) {
-                    vfs_get_full_path(current_dir, full_path, sizeof(full_path));
-                    int len = strlen(full_path);
-                    if (full_path[len-1] != '/') {
-                        strcat(full_path, "/");
-                    }
-                    strcat(full_path, filename);
                 } else {
-                    snprintf(full_path, sizeof(full_path), "/%s", filename);
+                    if (strcmp(current_dir_path, "/") == 0) {
+                        snprintf(full_path, sizeof(full_path), "/%s", filename);
+                    } else {
+                        snprintf(full_path, sizeof(full_path), "%s/%s", current_dir_path, filename);
+                    }
                 }
                 
                 // Save using the full path
@@ -348,18 +348,15 @@ void paint_program(vfs_node_t *current_dir) {
                 static uint8_t load_buffer[320 * 163];
                 
                 // Construct full path
-                char full_path[VFS_MAX_PATH_LEN];
+                char full_path[256];
                 if (filename[0] == '/') {
                     strncpy(full_path, filename, sizeof(full_path));
-                } else if (current_dir) {
-                    vfs_get_full_path(current_dir, full_path, sizeof(full_path));
-                    int len = strlen(full_path);
-                    if (full_path[len-1] != '/') {
-                        strcat(full_path, "/");
-                    }
-                    strcat(full_path, filename);
                 } else {
-                    snprintf(full_path, sizeof(full_path), "/%s", filename);
+                    if (strcmp(current_dir_path, "/") == 0) {
+                        snprintf(full_path, sizeof(full_path), "/%s", filename);
+                    } else {
+                        snprintf(full_path, sizeof(full_path), "%s/%s", current_dir_path, filename);
+                    }
                 }
                 
                 int result = load_canvas_bmp(load_buffer, 320, 163, full_path);

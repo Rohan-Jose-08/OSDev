@@ -5,7 +5,7 @@
 #include <string.h>
 #include <kernel/tty.h>
 #include <kernel/keyboard.h>
-#include <kernel/vfs.h>
+#include <kernel/fs.h>
 
 #define MAX_LINES 100
 #define MAX_LINE_LENGTH 80
@@ -491,8 +491,8 @@ static void editor_save_file(void) {
 		file_buffer[0] = '\0';
 	}
 	
-	// Write to VFS (creates file if it doesn't exist)
-	int result = vfs_write_path(editor.filename, (const uint8_t*)file_buffer, offset);
+	// Write to disk filesystem (creates file if it doesn't exist)
+	int result = fs_write_file(editor.filename, (const uint8_t*)file_buffer, offset, 0);
 	if (result >= 0) {
 		editor.modified = false;
 	}
@@ -501,7 +501,7 @@ static void editor_save_file(void) {
 static void editor_load_file(void) {
 	static char file_buffer[MAX_LINES * MAX_LINE_LENGTH];
 	
-	int bytes_read = vfs_read_path(editor.filename, (uint8_t*)file_buffer, sizeof(file_buffer) - 1, 0);
+	int bytes_read = fs_read_file(editor.filename, (uint8_t*)file_buffer, sizeof(file_buffer) - 1, 0);
 	if (bytes_read <= 0) {
 		// File doesn't exist or is empty, start with empty content
 		editor.lines[0][0] = '\0';

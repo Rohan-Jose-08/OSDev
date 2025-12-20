@@ -44,6 +44,7 @@ string/strcmp.o \
 string/strcpy.o \
 string/strcat.o \
 string/strncpy.o \
+string/strchr.o \
 string/strrchr.o \
 
 HOSTEDOBJS=\
