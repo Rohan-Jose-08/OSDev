@@ -25,8 +25,25 @@
 // ATA commands
 #define ATA_CMD_READ_SECTORS  0x20
 #define ATA_CMD_WRITE_SECTORS 0x30
+#define ATA_CMD_READ_DMA      0xC8
+#define ATA_CMD_WRITE_DMA     0xCA
 #define ATA_CMD_IDENTIFY      0xEC
 #define ATA_CMD_CACHE_FLUSH   0xE7
+
+// Bus Master IDE registers
+#define BM_COMMAND_REG    0
+#define BM_STATUS_REG     2
+#define BM_PRDT_REG       4
+
+// Bus Master commands
+#define BM_CMD_START      0x01
+#define BM_CMD_READ       0x08  // 0 = write to memory, 1 = read from memory
+
+// Bus Master status
+#define BM_STATUS_ERROR   0x02
+#define BM_STATUS_IRQ     0x04
+#define BM_STATUS_DMA0    0x20
+#define BM_STATUS_DMA1    0x40
 
 // ATA status bits
 #define ATA_SR_BSY  0x80  // Busy
@@ -45,11 +62,19 @@
 typedef struct {
     uint16_t base;              // I/O base address
     uint16_t control;           // Control base address
+    uint16_t bmide;             // Bus Master IDE base address
     uint8_t drive;              // 0 = master, 1 = slave
     bool exists;                // Does this device exist?
     uint32_t size_sectors;      // Size in sectors
     char model[41];             // Model string
 } ata_device_t;
+
+// Physical Region Descriptor Table entry
+typedef struct {
+    uint32_t buffer_phys;       // Physical address of buffer
+    uint16_t byte_count;        // Number of bytes (0 = 64KB)
+    uint16_t reserved;          // Bit 15 = end of table marker
+} __attribute__((packed)) prdt_entry_t;
 
 // Initialize ATA driver
 void ata_init(void);

@@ -12,7 +12,7 @@
 
 // Mode 13h constants (backward compatibility)
 #define MODE13H_WIDTH   320
-#define MODE13H_HEIGHT  200
+#define MODE13H_HEIGHT  240
 #define MODE13H_MEMORY  ((uint8_t*)0xA0000)
 
 // VGA memory address

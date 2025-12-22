@@ -49,6 +49,13 @@ kernel/paint.o \
 kernel/task.o \
 kernel/fs.o \
 kernel/kmalloc.o \
+kernel/window.o \
+kernel/desktop.o \
+kernel/menu_bar.o \
+kernel/paint_windowed.o \
+kernel/calculator.o \
+kernel/file_manager.o \
+kernel/file_dialog.o \
 
 
 

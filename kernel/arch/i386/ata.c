@@ -6,6 +6,14 @@
 
 static ata_device_t ata_devices[4]; // Primary master/slave, Secondary master/slave
 
+// DMA buffers and PRDT (must be physically contiguous and aligned)
+static uint8_t dma_buffer[65536] __attribute__((aligned(65536)));
+static prdt_entry_t prdt[16] __attribute__((aligned(4)));
+
+// Bus Master IDE base addresses (will be detected or use defaults)
+static uint16_t primary_bmide = 0;
+static uint16_t secondary_bmide = 0;
+
 // Read ATA register
 static inline uint8_t ata_read_reg(uint16_t base, uint8_t reg) {
     return inb(base + reg);
@@ -19,14 +27,12 @@ static inline void ata_write_reg(uint16_t base, uint8_t reg, uint8_t value) {
 // Wait for BSY to clear
 bool ata_wait_ready(uint16_t base) {
     uint8_t status;
-    // Wait up to ~1 second
-    for (int i = 0; i < 10000; i++) {
+    // Wait with faster polling
+    for (int i = 0; i < 1000; i++) {
         status = ata_read_reg(base, ATA_REG_STATUS);
         if (!(status & ATA_SR_BSY)) {
             return true;
         }
-        // Small delay
-        for (volatile int j = 0; j < 1000; j++);
     }
     return false;
 }
@@ -34,15 +40,90 @@ bool ata_wait_ready(uint16_t base) {
 // Wait for DRQ to be set
 bool ata_wait_drq(uint16_t base) {
     uint8_t status;
-    // Wait up to ~1 second
-    for (int i = 0; i < 10000; i++) {
+    // Wait with faster polling
+    for (int i = 0; i < 1000; i++) {
         status = ata_read_reg(base, ATA_REG_STATUS);
         if (status & ATA_SR_DRQ) {
             return true;
         }
-        // Small delay
-        for (volatile int j = 0; j < 1000; j++);
     }
+    return false;
+}
+
+// Setup DMA transfer
+static bool ata_setup_dma(uint16_t bmide, const uint8_t *buffer, uint32_t byte_count, bool is_write) {
+    if (bmide == 0 || byte_count == 0 || byte_count > 65536) {
+        return false;
+    }
+    
+    // Build PRDT - split into chunks if needed
+    uint32_t remaining = byte_count;
+    uint32_t offset = 0;
+    int prdt_entries = 0;
+    
+    while (remaining > 0 && prdt_entries < 16) {
+        uint32_t chunk_size = (remaining > 65536) ? 65536 : remaining;
+        
+        prdt[prdt_entries].buffer_phys = (uint32_t)(buffer + offset);
+        prdt[prdt_entries].byte_count = (chunk_size == 65536) ? 0 : chunk_size;  // 0 means 64KB
+        prdt[prdt_entries].reserved = (remaining <= chunk_size) ? 0x8000 : 0;  // Set EOT on last entry
+        
+        remaining -= chunk_size;
+        offset += chunk_size;
+        prdt_entries++;
+    }
+    
+    // Stop any current DMA transfer
+    outb(bmide + BM_COMMAND_REG, 0);
+    
+    // Set PRDT address
+    outl(bmide + BM_PRDT_REG, (uint32_t)prdt);
+    
+    // Clear error and interrupt flags
+    uint8_t status = inb(bmide + BM_STATUS_REG);
+    outb(bmide + BM_STATUS_REG, status | BM_STATUS_ERROR | BM_STATUS_IRQ);
+    
+    // Set direction (0 = write to memory/read from drive, 1 = read from memory/write to drive)
+    uint8_t cmd = is_write ? BM_CMD_READ : 0;  // Yes, this is backwards!
+    outb(bmide + BM_COMMAND_REG, cmd);
+    
+    return true;
+}
+
+// Start DMA transfer
+static void ata_start_dma(uint16_t bmide) {
+    uint8_t cmd = inb(bmide + BM_COMMAND_REG);
+    outb(bmide + BM_COMMAND_REG, cmd | BM_CMD_START);
+}
+
+// Wait for DMA completion
+static bool ata_wait_dma(uint16_t bmide, uint16_t ata_base) {
+    // Wait for DMA to complete
+    for (int i = 0; i < 100000; i++) {
+        uint8_t bm_status = inb(bmide + BM_STATUS_REG);
+        uint8_t ata_status = ata_read_reg(ata_base, ATA_REG_STATUS);
+        
+        // Check if DMA is still active
+        uint8_t cmd = inb(bmide + BM_COMMAND_REG);
+        if (!(cmd & BM_CMD_START)) {
+            // DMA stopped - check for errors
+            if (bm_status & BM_STATUS_ERROR) {
+                outb(bmide + BM_COMMAND_REG, 0);
+                return false;
+            }
+            if (ata_status & ATA_SR_ERR) {
+                outb(bmide + BM_COMMAND_REG, 0);
+                return false;
+            }
+            if (!(ata_status & ATA_SR_BSY)) {
+                outb(bmide + BM_COMMAND_REG, 0);
+                return true;
+            }
+        }
+    }
+    
+    // Timeout - stop DMA
+    outb(bmide + BM_COMMAND_REG, 0);
     return false;
 }
 
@@ -117,9 +198,28 @@ void ata_init(void) {
     
     memset(ata_devices, 0, sizeof(ata_devices));
     
+    // Try to detect Bus Master IDE address from common locations
+    // Most systems use 0xC000-0xC00F for primary/secondary BMIDE
+    // Try reading the status register - if it returns sensible values, we found it
+    for (uint16_t test_addr = 0xC000; test_addr < 0xD000; test_addr += 0x10) {
+        uint8_t status = inb(test_addr + BM_STATUS_REG);
+        // Valid status should have some bits but not all FFs
+        if (status != 0xFF && status != 0x00) {
+            primary_bmide = test_addr;
+            secondary_bmide = test_addr + 8;
+            printf("ATA: Detected Bus Master IDE at 0x%x\n", test_addr);
+            break;
+        }
+    }
+    
+    if (primary_bmide == 0) {
+        printf("ATA: Bus Master IDE not detected, DMA disabled\n");
+    }
+    
     // Check primary master
     ata_devices[0].base = ATA_PRIMARY_IO;
     ata_devices[0].control = ATA_PRIMARY_CONTROL;
+    ata_devices[0].bmide = primary_bmide;
     ata_devices[0].drive = 0;
     if (ata_identify(ATA_PRIMARY_IO, 0, &ata_devices[0])) {
         ata_devices[0].exists = true;
@@ -132,6 +232,7 @@ void ata_init(void) {
     // Check primary slave
     ata_devices[1].base = ATA_PRIMARY_IO;
     ata_devices[1].control = ATA_PRIMARY_CONTROL;
+    ata_devices[1].bmide = primary_bmide;
     ata_devices[1].drive = 1;
     if (ata_identify(ATA_PRIMARY_IO, 1, &ata_devices[1])) {
         ata_devices[1].exists = true;
@@ -144,6 +245,7 @@ void ata_init(void) {
     // Check secondary master
     ata_devices[2].base = ATA_SECONDARY_IO;
     ata_devices[2].control = ATA_SECONDARY_CONTROL;
+    ata_devices[2].bmide = secondary_bmide;
     ata_devices[2].drive = 0;
     if (ata_identify(ATA_SECONDARY_IO, 0, &ata_devices[2])) {
         ata_devices[2].exists = true;
@@ -156,6 +258,7 @@ void ata_init(void) {
     // Check secondary slave
     ata_devices[3].base = ATA_SECONDARY_IO;
     ata_devices[3].control = ATA_SECONDARY_CONTROL;
+    ata_devices[3].bmide = secondary_bmide;
     ata_devices[3].drive = 1;
     if (ata_identify(ATA_SECONDARY_IO, 1, &ata_devices[3])) {
         ata_devices[3].exists = true;
@@ -219,50 +322,104 @@ bool ata_read_sectors(uint8_t drive, uint32_t lba, uint8_t sector_count, uint8_t
     return true;
 }
 
-// Write sectors to disk
+// Write sectors to disk using DMA (with PIO fallback)
 bool ata_write_sectors(uint8_t drive, uint32_t lba, uint8_t sector_count, const uint8_t *buffer) {
-    if (drive >= 4 || !ata_devices[drive].exists) {
+    if (drive >= 4 || !ata_devices[drive].exists || sector_count == 0) {
         return false;
     }
     
     ata_device_t *device = &ata_devices[drive];
     uint16_t base = device->base;
+    uint16_t bmide = device->bmide;
     
-    // Wait for drive to be ready
-    if (!ata_wait_ready(base)) {
-        return false;
+    // Try DMA if available
+    if (bmide != 0 && sector_count <= 128) {
+        uint32_t byte_count = sector_count * ATA_SECTOR_SIZE;
+        
+        // Copy to aligned DMA buffer
+        if (byte_count <= sizeof(dma_buffer)) {
+            memcpy(dma_buffer, buffer, byte_count);
+            
+            // Wait for drive ready
+            if (!ata_wait_ready(base)) {
+                goto fallback_pio;
+            }
+            
+            // Setup DMA
+            if (!ata_setup_dma(bmide, dma_buffer, byte_count, true)) {
+                goto fallback_pio;
+            }
+            
+            // Select drive and set LBA mode
+            ata_write_reg(base, ATA_REG_DRIVE, 0xE0 | (device->drive << 4) | ((lba >> 24) & 0x0F));
+            
+            // Set sector count and LBA
+            ata_write_reg(base, ATA_REG_SECCOUNT, sector_count);
+            ata_write_reg(base, ATA_REG_LBA_LO, lba & 0xFF);
+            ata_write_reg(base, ATA_REG_LBA_MID, (lba >> 8) & 0xFF);
+            ata_write_reg(base, ATA_REG_LBA_HI, (lba >> 16) & 0xFF);
+            
+            // Send DMA WRITE command
+            ata_write_reg(base, ATA_REG_COMMAND, ATA_CMD_WRITE_DMA);
+            
+            // Start DMA
+            ata_start_dma(bmide);
+            
+            // Wait for completion
+            if (ata_wait_dma(bmide, base)) {
+                return true;
+            }
+            
+            // DMA failed, fall back to PIO
+            printf("ATA: DMA failed, falling back to PIO\n");
+        }
     }
     
-    // Select drive and set LBA mode with top 4 bits of LBA
-    ata_write_reg(base, ATA_REG_DRIVE, 0xE0 | (device->drive << 4) | ((lba >> 24) & 0x0F));
+fallback_pio:
+    // PIO fallback - write in chunks
+    uint8_t remaining = sector_count;
+    uint32_t offset = 0;
     
-    // Set sector count
-    ata_write_reg(base, ATA_REG_SECCOUNT, sector_count);
-    
-    // Set LBA low, mid, high
-    ata_write_reg(base, ATA_REG_LBA_LO, lba & 0xFF);
-    ata_write_reg(base, ATA_REG_LBA_MID, (lba >> 8) & 0xFF);
-    ata_write_reg(base, ATA_REG_LBA_HI, (lba >> 16) & 0xFF);
-    
-    // Send WRITE command
-    ata_write_reg(base, ATA_REG_COMMAND, ATA_CMD_WRITE_SECTORS);
-    
-    // Write sectors
-    for (int i = 0; i < sector_count; i++) {
-        // Wait for DRQ
-        if (!ata_wait_drq(base)) {
+    while (remaining > 0) {
+        uint8_t chunk_size = (remaining > 64) ? 64 : remaining;
+        
+        // Wait for drive to be ready
+        if (!ata_wait_ready(base)) {
             return false;
         }
         
-        // Write sector data
-        const uint16_t *buf16 = (const uint16_t *)(buffer + i * ATA_SECTOR_SIZE);
-        for (int j = 0; j < 256; j++) {
-            outw(base + ATA_REG_DATA, buf16[j]);
+        // Select drive and set LBA mode
+        uint32_t current_lba = lba + (offset / ATA_SECTOR_SIZE);
+        ata_write_reg(base, ATA_REG_DRIVE, 0xE0 | (device->drive << 4) | ((current_lba >> 24) & 0x0F));
+        
+        // Set sector count and LBA
+        ata_write_reg(base, ATA_REG_SECCOUNT, chunk_size);
+        ata_write_reg(base, ATA_REG_LBA_LO, current_lba & 0xFF);
+        ata_write_reg(base, ATA_REG_LBA_MID, (current_lba >> 8) & 0xFF);
+        ata_write_reg(base, ATA_REG_LBA_HI, (current_lba >> 16) & 0xFF);
+        
+        // Send WRITE command
+        ata_write_reg(base, ATA_REG_COMMAND, ATA_CMD_WRITE_SECTORS);
+        
+        // Write sectors in this chunk
+        for (int i = 0; i < chunk_size; i++) {
+            // Wait for DRQ
+            if (!ata_wait_drq(base)) {
+                return false;
+            }
+            
+            // Write sector data
+            const uint16_t *buf16 = (const uint16_t *)(buffer + offset + i * ATA_SECTOR_SIZE);
+            for (int j = 0; j < 256; j++) {
+                outw(base + ATA_REG_DATA, buf16[j]);
+            }
         }
+        
+        remaining -= chunk_size;
+        offset += chunk_size * ATA_SECTOR_SIZE;
     }
     
-    // Flush cache
-    ata_write_reg(base, ATA_REG_COMMAND, ATA_CMD_CACHE_FLUSH);
+    // Wait for write to complete
     if (!ata_wait_ready(base)) {
         return false;
     }

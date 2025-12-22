@@ -144,28 +144,29 @@ static void set_display_dimensions(int width, int height) {
     display_buffer_size = width * height;
 }
 
-// Switch to Mode 13h variant with tweaked timing (320x240-ish, 256 colors)
-// Note: True Mode X requires planar memory access. This is a tweaked Mode 13h.
+// Switch to Mode 13h (320x200, 256 colors) using VGA registers
 static void set_mode_320x240(void) {
     __asm__ volatile ("cli");
     
-    // Use Mode 13h as base (chain-4 enabled for linear memory)
-    outb(0x3C2, 0x63); // Misc Output Register
+    // Misc Output Register
+    outb(0x3C2, 0x63);
     
-    // Sequencer registers (keep chain-4 enabled)
+    // Sequencer registers
     outb(0x3C4, 0x00); outb(0x3C5, 0x03);
     outb(0x3C4, 0x01); outb(0x3C5, 0x01);
     outb(0x3C4, 0x02); outb(0x3C5, 0x0F);
     outb(0x3C4, 0x03); outb(0x3C5, 0x00);
-    outb(0x3C4, 0x04); outb(0x3C5, 0x0E); // Memory mode (chain-4)
+    outb(0x3C4, 0x04); outb(0x3C5, 0x0E);
     
-    // CRTC registers - modified for taller display
-    outb(0x3D4, 0x11); outb(0x3D5, 0x00); // Unprotect CRTC
+    // Unprotect CRTC registers
+    outb(0x3D4, 0x11); outb(0x3D5, 0x00);
     
+    // CRTC registers - tried various Mode X 320x240 timings but they don't fully work
+    // Reverting to working 320x200 Mode 13h-style timing
     const uint8_t crtc_regs[] = {
-        0x5F, 0x4F, 0x50, 0x82, 0x54, 0x80, 0x0D, 0x3E,  // Horizontal timing
-        0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // Misc
-        0xEA, 0x8C, 0xDF, 0x28, 0x00, 0xE7, 0x04, 0xE3, 0xFF  // Vertical timing (taller)
+        0x5F, 0x4F, 0x50, 0x82, 0x54, 0x80, 0xBF, 0x1F,  // 0x00-0x07
+        0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // 0x08-0x0F
+        0x9C, 0x0E, 0x8F, 0x28, 0x40, 0x96, 0xB9, 0xA3, 0xFF  // 0x10-0x18
     };
     
     for (int i = 0; i < 25; i++) {
@@ -173,14 +174,14 @@ static void set_mode_320x240(void) {
         outb(0x3D5, crtc_regs[i]);
     }
     
-    // Graphics Controller (chain-4 mode)
+    // Graphics Controller
     outb(0x3CE, 0x00); outb(0x3CF, 0x00);
     outb(0x3CE, 0x01); outb(0x3CF, 0x00);
     outb(0x3CE, 0x02); outb(0x3CF, 0x00);
     outb(0x3CE, 0x03); outb(0x3CF, 0x00);
     outb(0x3CE, 0x04); outb(0x3CF, 0x00);
-    outb(0x3CE, 0x05); outb(0x3CF, 0x40);  // Mode 0 (chain-4)
-    outb(0x3CE, 0x06); outb(0x3CF, 0x05);  // Memory map A0000
+    outb(0x3CE, 0x05); outb(0x3CF, 0x40);
+    outb(0x3CE, 0x06); outb(0x3CF, 0x05);
     outb(0x3CE, 0x07); outb(0x3CF, 0x0F);
     outb(0x3CE, 0x08); outb(0x3CF, 0xFF);
     
@@ -198,7 +199,13 @@ static void set_mode_320x240(void) {
     }
     
     outb(0x3C0, 0x20);
-    // Keep it at 320x200 for now since true 240 lines with chain-4 doesn't work well
+    
+    // Clear screen memory
+    uint8_t* vga = (uint8_t*)0xA0000;
+    for (int i = 0; i < 320 * 200; i++) {
+        vga[i] = 0;
+    }
+    
     set_display_dimensions(320, 200);
     __asm__ volatile ("sti");
 }
@@ -262,7 +269,7 @@ static void set_mode_13h(void) {
     
     outb(0x3C0, 0x20); // Enable video
     
-    set_display_dimensions(320, 200);
+    set_display_dimensions(320, 240);
     __asm__ volatile ("sti");
 }
 

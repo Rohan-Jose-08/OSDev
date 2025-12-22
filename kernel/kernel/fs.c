@@ -502,6 +502,40 @@ static int get_file_block(fs_inode_t *inode, uint32_t block_index, bool allocate
     return indirect_blocks[block_index];
 }
 
+// Free all blocks used by a file
+static void free_file_blocks(fs_inode_t *inode) {
+    if (!inode || inode->type != 1) return;
+    
+    // Free direct blocks
+    for (int i = 0; i < FS_DIRECT_BLOCKS; i++) {
+        if (inode->blocks[i] != 0) {
+            inode->blocks[i] = 0;
+            fs_ctx.superblock.free_blocks++;
+        }
+    }
+    
+    // Free indirect block and all blocks it points to
+    if (inode->blocks[FS_INDIRECT_BLOCK] != 0) {
+        // Read indirect block to get list of data blocks
+        if (read_block(inode->blocks[FS_INDIRECT_BLOCK], indirect_buffer)) {
+            uint32_t *indirect_blocks = (uint32_t*)indirect_buffer;
+            for (int i = 0; i < FS_PTRS_PER_BLOCK; i++) {
+                if (indirect_blocks[i] != 0) {
+                    indirect_blocks[i] = 0;  // Clear the entry
+                    fs_ctx.superblock.free_blocks++;
+                }
+            }
+            // Write back the cleared indirect block to disk
+            write_block(inode->blocks[FS_INDIRECT_BLOCK], indirect_buffer);
+        }
+        // Free the indirect block itself
+        inode->blocks[FS_INDIRECT_BLOCK] = 0;
+        fs_ctx.superblock.free_blocks++;
+    }
+    
+    inode->size = 0;
+}
+
 // Write to a file
 int fs_write_file(const char *path, const uint8_t *buffer, uint32_t size, uint32_t offset) {
     if (!fs_ctx.mounted) {
@@ -523,6 +557,17 @@ int fs_write_file(const char *path, const uint8_t *buffer, uint32_t size, uint32
         return -1;
     }
     
+    // Free existing blocks before writing new content
+    free_file_blocks(inode);
+    
+    // Save inode table immediately after freeing so find_free_block sees the cleared blocks
+    save_inode_table();
+    
+    // Save superblock after freeing to persist free_blocks count
+    memset(block_buffer, 0, FS_BLOCK_SIZE);
+    memcpy(block_buffer, &fs_ctx.superblock, sizeof(fs_superblock_t));
+    write_block(0, block_buffer);
+    
     // Calculate blocks needed
     uint32_t blocks_needed = (size + FS_BLOCK_SIZE - 1) / FS_BLOCK_SIZE;
     uint32_t max_blocks = FS_DIRECT_BLOCKS + FS_PTRS_PER_BLOCK;  // 11 direct + 128 indirect = 139 blocks = ~71KB
@@ -530,7 +575,7 @@ int fs_write_file(const char *path, const uint8_t *buffer, uint32_t size, uint32
         blocks_needed = max_blocks;
     }
     
-    // Write data block by block
+    // Write data block by block (safer than batching for now)
     uint32_t written = 0;
     static uint8_t write_buffer[FS_BLOCK_SIZE];
     
@@ -546,10 +591,12 @@ int fs_write_file(const char *path, const uint8_t *buffer, uint32_t size, uint32
             to_write = FS_BLOCK_SIZE;
         }
         
+        // Prepare block with padding if needed
         memset(write_buffer, 0, FS_BLOCK_SIZE);
         memcpy(write_buffer, buffer + written, to_write);
         
-        if (!write_block(block_num, write_buffer)) {
+        // Write single block
+        if (!ata_write_sectors(fs_ctx.drive, block_num, 1, write_buffer)) {
             break;
         }
         
@@ -557,7 +604,14 @@ int fs_write_file(const char *path, const uint8_t *buffer, uint32_t size, uint32
     }
     
     inode->size = written;
+    
+    // Save inode table after all writes complete
     save_inode_table();
+    
+    // Update superblock to reflect freed/allocated blocks
+    memset(block_buffer, 0, FS_BLOCK_SIZE);
+    memcpy(block_buffer, &fs_ctx.superblock, sizeof(fs_superblock_t));
+    write_block(0, block_buffer);
     
     return written;
 }
@@ -675,10 +729,16 @@ bool fs_delete(const char *path) {
     
     fs_inode_t *inode = &inode_cache[inode_num];
     
-    // Free the data blocks
-    for (int i = 0; i < FS_INODE_BLOCKS; i++) {
-        if (inode->blocks[i] != 0) {
-            fs_ctx.superblock.free_blocks++;
+    // Use free_file_blocks to properly free all blocks (including indirect)
+    if (inode->type == 1) {
+        free_file_blocks(inode);
+    } else {
+        // For directories, just free direct blocks (no indirect support yet)
+        for (int i = 0; i < FS_DIRECT_BLOCKS; i++) {
+            if (inode->blocks[i] != 0) {
+                inode->blocks[i] = 0;
+                fs_ctx.superblock.free_blocks++;
+            }
         }
     }
     
@@ -695,4 +755,68 @@ bool fs_delete(const char *path) {
     write_block(0, block_buffer);
     
     return true;
+}
+
+// Rename a file or directory
+bool fs_rename(const char *old_path, const char *new_name) {
+    if (!fs_ctx.mounted) {
+        return false;
+    }
+    
+    // Find the inode
+    int inode_num = find_inode_by_name(old_path);
+    if (inode_num < 0) {
+        return false;  // File not found
+    }
+    
+    // Check if new name is too long
+    if (strlen(new_name) >= FS_MAX_FILENAME) {
+        return false;
+    }
+    
+    // Check if new name contains invalid characters
+    if (strchr(new_name, '/') != NULL) {
+        return false;
+    }
+    
+    // Get parent directory path to check for duplicates
+    char parent_path[128];
+    const char *last_slash = strrchr(old_path, '/');
+    if (last_slash && last_slash != old_path) {
+        int len = last_slash - old_path;
+        memcpy(parent_path, old_path, len);
+        parent_path[len] = '\0';
+    } else {
+        strcpy(parent_path, "/");
+    }
+    
+    // Get parent inode
+    int parent_inode_num = resolve_path(parent_path);
+    if (parent_inode_num < 0) {
+        return false;
+    }
+    
+    // Check if a file with new name already exists in same directory
+    int existing = find_inode_in_dir(parent_inode_num, new_name);
+    if (existing >= 0 && existing != inode_num) {
+        return false;  // Name already exists
+    }
+    
+    // Update the inode's name
+    fs_inode_t *inode = &inode_cache[inode_num];
+    strncpy(inode->name, new_name, FS_MAX_FILENAME - 1);
+    inode->name[FS_MAX_FILENAME - 1] = '\0';
+    
+    // Save changes
+    save_inode_table();
+    
+    return true;
+}
+
+// Get free blocks count
+uint32_t fs_get_free_blocks(void) {
+    if (!fs_ctx.mounted) {
+        return 0;
+    }
+    return fs_ctx.superblock.free_blocks;
 }

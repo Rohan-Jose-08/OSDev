@@ -77,6 +77,9 @@ int fs_create_dir(const char *path);
 // Delete a file or directory
 bool fs_delete(const char *path);
 
+// Rename a file or directory
+bool fs_rename(const char *old_path, const char *new_name);
+
 // Read from a file
 int fs_read_file(const char *path, uint8_t *buffer, uint32_t size, uint32_t offset);
 
@@ -88,6 +91,9 @@ int fs_list_dir(const char *path, fs_dirent_t *entries, int max_entries);
 
 // Get file/directory info
 bool fs_stat(const char *path, fs_inode_t *inode);
+
+// Get free blocks count
+uint32_t fs_get_free_blocks(void);
 
 // Get filesystem context
 fs_context_t* fs_get_context(void);

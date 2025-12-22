@@ -11,11 +11,17 @@
 #include <kernel/snake.h>
 #include <kernel/graphics_demo.h>
 #include <kernel/graphics.h>
+#include <kernel/gui_demo.h>
+#include <kernel/gui_apps.h>
+#include <kernel/desktop.h>
 #include <kernel/task.h>
 #include <kernel/timer.h>
 #include <kernel/ata.h>
 #include <kernel/fs.h>
 #include <kernel/kmalloc.h>
+#include <kernel/paint.h>
+#include <kernel/calculator.h>
+#include <kernel/file_manager.h>
 
 // Path length constant (previously from vfs.h)
 #define MAX_PATH_LEN 512
@@ -125,6 +131,11 @@ static void command_edit(const char* args);
 static void command_gfx(void);
 static void command_gfxanim(void);
 static void command_gfxpaint(void);
+static void command_gui(void);
+static void command_guipaint(void);
+static void command_guicalc(void);
+static void command_guifilemgr(void);
+static void command_desktop(void);
 static void command_ls(const char* args);
 static void command_cat(const char* args);
 static void command_rm(const char* args);
@@ -447,6 +458,11 @@ static void execute_command(const char* command) {
 		{"gfx", command_gfx, NULL, false},
 		{"gfxanim", command_gfxanim, NULL, false},
 		{"gfxpaint", command_gfxpaint, NULL, false},
+		{"gui", command_gui, NULL, false},
+		{"guipaint", command_guipaint, NULL, false},
+		{"guicalc", command_guicalc, NULL, false},
+		{"guifilemgr", command_guifilemgr, NULL, false},
+		{"desktop", command_desktop, NULL, false},
 		{"echo", NULL, command_echo, true},
 		{"color", NULL, command_color, true},
 		{"calc", NULL, command_calc, true},
@@ -618,6 +634,19 @@ static void command_help(void) {
 	printf("  cpuinfo       - Detailed CPU information\n");
 	printf("  rdtsc         - Read timestamp counter\n");
 	printf("  regs          - Display control registers\n");
+	
+	printf("\n");
+	terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
+	printf("GUI/Graphics:");
+	terminal_setcolor(old_color);
+	printf("\n");
+	printf("  gfx           - Graphics demonstration\n");
+	printf("  gfxanim       - Graphics animation\n");
+	printf("  gfxpaint      - Paint program\n");
+	printf("  gui           - Window manager demo (ESC to exit)\n");
+	printf("  guipaint      - GUI Paint application\n");
+	printf("  guicalc       - GUI Calculator\n");
+	printf("  guifilemgr    - GUI File Manager\n");
 	printf("  benchmark     - CPU performance benchmark\n");
 	
 	printf("\n");
@@ -2283,6 +2312,40 @@ static void command_gfxanim(void) {
 static void command_gfxpaint(void) {
 	printf("Starting paint demo...\n");
 	graphics_paint_demo_with_dir(current_dir_path);
+}
+
+static void command_gui(void) {
+	printf("Starting GUI window manager demo...\n");
+	printf("Use mouse to click and drag windows\n");
+	printf("Press ESC to exit\n\n");
+	desktop_run();
+}
+
+static void command_guipaint(void) {
+	printf("Starting GUI Paint application...\n");
+	printf("Click and drag to draw. Click colors to change. Press C to clear.\n");
+	printf("Press ESC to exit\n\n");
+	paint_app_windowed(NULL);
+}
+
+static void command_guicalc(void) {
+	printf("Starting GUI Calculator...\n");
+	printf("Click buttons or use keyboard. Press ESC to exit.\n\n");
+	calculator_app();
+}
+
+static void command_guifilemgr(void) {
+	printf("Starting GUI File Manager...\n");
+	printf("Click files to select. W/S to scroll. Press ESC to exit.\n\n");
+	file_manager_app();
+}
+
+static void command_desktop(void) {
+	printf("Starting Desktop Environment...\n");
+	printf("Click Start menu or desktop icons to launch apps.\n");
+	printf("Multiple windows of each app can be opened.\n");
+	printf("Press ESC to exit.\n\n");
+	desktop_run();
 }
 
 // Demo task functions
