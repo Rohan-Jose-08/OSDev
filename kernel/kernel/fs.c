@@ -655,7 +655,10 @@ int fs_read_file(const char *path, uint8_t *buffer, uint32_t size, uint32_t offs
         }
         
         if (!read_block(block_num, read_buffer)) {
-            return -1;
+            // Retry once in case the device was briefly busy.
+            if (!read_block(block_num, read_buffer)) {
+                return -1;
+            }
         }
         
         uint32_t to_read = FS_BLOCK_SIZE - block_offset;

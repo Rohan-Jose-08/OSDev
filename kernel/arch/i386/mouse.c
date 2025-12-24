@@ -133,7 +133,10 @@ void mouse_handler(void) {
 			current_state.y = mouse_byte[2];
 			
 			// Handle scroll wheel from 4th byte
-			int8_t scroll = (int8_t)mouse_byte[3];
+			int8_t scroll = (int8_t)(mouse_byte[3] & 0x0F);
+			if (scroll & 0x08) {
+				scroll |= 0xF0;
+			}
 			if (scroll != 0) {
 				current_state.scroll = scroll;
 				

@@ -24,6 +24,13 @@ typedef struct {
     bool is_directory;
 } file_entry_t;
 
+typedef enum {
+    FM_INPUT_NONE = 0,
+    FM_INPUT_RENAME,
+    FM_INPUT_NEW_FILE,
+    FM_INPUT_NEW_FOLDER
+} fm_input_action_t;
+
 typedef struct {
     window_t* window;
     menu_bar_t* menu_bar;
@@ -33,6 +40,7 @@ typedef struct {
     int selected_index;
     int scroll_offset;
     bool input_mode;
+    fm_input_action_t input_action;
     char input_buffer[32];
     int input_cursor;
 } file_manager_state_t;
@@ -46,55 +54,62 @@ static void fm_draw_file_list(void);
 static void fm_draw_toolbar(void);
 static void fm_draw_status_bar(void);
 static void fm_on_destroy(window_t* window);
+static void fm_begin_input(fm_input_action_t action, const char* initial_text);
+static void fm_select_by_name(const char* name);
+
+static void fm_begin_input(fm_input_action_t action, const char* initial_text) {
+    if (!fm_state || !fm_state->window) return;
+    
+    fm_state->input_mode = true;
+    fm_state->input_action = action;
+    if (initial_text) {
+        strncpy(fm_state->input_buffer, initial_text, sizeof(fm_state->input_buffer) - 1);
+        fm_state->input_buffer[sizeof(fm_state->input_buffer) - 1] = '\0';
+    } else {
+        fm_state->input_buffer[0] = '\0';
+    }
+    fm_state->input_cursor = strlen(fm_state->input_buffer);
+    
+    fm_draw_status_bar();
+    window_draw(fm_state->window);
+}
+
+static void fm_select_by_name(const char* name) {
+    if (!fm_state || !name) return;
+    
+    for (int i = 0; i < fm_state->file_count; i++) {
+        if (strcmp(fm_state->files[i].name, name) == 0) {
+            fm_state->selected_index = i;
+            int visible_items = FM_SCROLL_AREA_HEIGHT / FM_FILE_ITEM_HEIGHT;
+            if (visible_items > 0) {
+                if (i < fm_state->scroll_offset) {
+                    fm_state->scroll_offset = i;
+                } else if (i >= fm_state->scroll_offset + visible_items) {
+                    fm_state->scroll_offset = i - visible_items + 1;
+                }
+            }
+            return;
+        }
+    }
+}
 
 // Menu callbacks
 static void fm_menu_new_file(window_t* window, void* user_data) {
     if (!fm_state) return;
     
-    // Create a new empty file with default name
-    char filename[64];
-    snprintf(filename, sizeof(filename), "newfile.txt");
+    (void)window;
+    (void)user_data;
     
-    char full_path[128];
-    if (strcmp(fm_state->current_path, "/") == 0) {
-        snprintf(full_path, sizeof(full_path), "/%s", filename);
-    } else {
-        snprintf(full_path, sizeof(full_path), "%s/%s", fm_state->current_path, filename);
-    }
-    
-    // Create the file
-    if (fs_create_file(full_path) >= 0) {
-        // Write empty content
-        fs_write_file(full_path, (const uint8_t*)"", 0, 0);
-        
-        // Refresh the list
-        fm_refresh_file_list();
-        fm_draw_file_list();
-        window_draw(window);
-    }
+    fm_begin_input(FM_INPUT_NEW_FILE, "newfile.txt");
 }
 
 static void fm_menu_new_folder(window_t* window, void* user_data) {
     if (!fm_state) return;
     
-    // Create a new directory with default name
-    char dirname[64];
-    snprintf(dirname, sizeof(dirname), "newfolder");
+    (void)window;
+    (void)user_data;
     
-    char full_path[128];
-    if (strcmp(fm_state->current_path, "/") == 0) {
-        snprintf(full_path, sizeof(full_path), "/%s", dirname);
-    } else {
-        snprintf(full_path, sizeof(full_path), "%s/%s", fm_state->current_path, dirname);
-    }
-    
-    // Create the directory
-    if (fs_create_dir(full_path) >= 0) {
-        // Refresh the list
-        fm_refresh_file_list();
-        fm_draw_file_list();
-        window_draw(window);
-    }
+    fm_begin_input(FM_INPUT_NEW_FOLDER, "newfolder");
 }
 
 static void fm_menu_rename(window_t* window, void* user_data) {
@@ -103,14 +118,14 @@ static void fm_menu_rename(window_t* window, void* user_data) {
         return;
     }
     
+    (void)window;
+    (void)user_data;
+    
     file_entry_t* entry = &fm_state->files[fm_state->selected_index];
     if (strcmp(entry->name, "..") == 0) return; // Don't rename parent dir
     
     // Enter input mode with current name
-    fm_state->input_mode = true;
-    strncpy(fm_state->input_buffer, entry->name, sizeof(fm_state->input_buffer) - 1);
-    fm_state->input_buffer[sizeof(fm_state->input_buffer) - 1] = '\0';
-    fm_state->input_cursor = strlen(fm_state->input_buffer);
+    fm_begin_input(FM_INPUT_RENAME, entry->name);
 }
 
 static void fm_menu_delete_file(window_t* window, void* user_data) {
@@ -293,12 +308,20 @@ static void fm_draw_status_bar(void) {
                     COLOR_LIGHT_GRAY);
     
     if (fm_state->input_mode) {
-        // Show rename input prompt
-        window_print(window, 10, status_y + 7, "Rename to:", COLOR_BLACK);
+        const char* prompt = "Rename to:";
+        if (fm_state->input_action == FM_INPUT_NEW_FILE) {
+            prompt = "New file:";
+        } else if (fm_state->input_action == FM_INPUT_NEW_FOLDER) {
+            prompt = "New folder:";
+        }
+        
+        // Show input prompt
+        int prompt_x = 10;
+        window_print(window, prompt_x, status_y + 7, prompt, COLOR_BLACK);
         
         // Draw input box
-        int input_x = 85;
-        int input_width = window->content_width - 95;
+        int input_x = prompt_x + (int)strlen(prompt) * 8 + 8;
+        int input_width = window->content_width - input_x - 10;
         window_fill_rect(window, input_x, status_y + 3, input_width, 16, COLOR_WHITE);
         window_draw_rect(window, input_x, status_y + 3, input_width, 16, COLOR_BLACK);
         
@@ -468,6 +491,7 @@ static void fm_on_click(window_t* window, int x, int y) {
     // If in input mode, clicking anywhere cancels it
     if (fm_state->input_mode) {
         fm_state->input_mode = false;
+        fm_state->input_action = FM_INPUT_NONE;
         fm_state->input_buffer[0] = '\0';
         fm_state->input_cursor = 0;
         fm_draw_status_bar();
@@ -502,43 +526,90 @@ static void fm_on_click(window_t* window, int x, int y) {
 static void fm_on_key(window_t* window, char key) {
     if (!fm_state) return;
     
-    // Handle input mode for rename
+    // Handle input mode for rename/create
     if (fm_state->input_mode) {
         if (key == '\n') {
-            // Enter - perform rename
-            if (fm_state->selected_index >= 0 && 
-                fm_state->selected_index < fm_state->file_count &&
-                strlen(fm_state->input_buffer) > 0) {
+            bool success = false;
+            bool exit_input = true;
+            
+            if (strlen(fm_state->input_buffer) > 0) {
+                char target_name[sizeof(fm_state->input_buffer)];
+                strncpy(target_name, fm_state->input_buffer, sizeof(target_name) - 1);
+                target_name[sizeof(target_name) - 1] = '\0';
                 
-                file_entry_t* entry = &fm_state->files[fm_state->selected_index];
-                
-                char full_path[128];
-                if (strcmp(fm_state->current_path, "/") == 0) {
-                    snprintf(full_path, sizeof(full_path), "/%s", entry->name);
-                } else {
-                    snprintf(full_path, sizeof(full_path), "%s/%s", 
-                            fm_state->current_path, entry->name);
+                if (fm_state->input_action == FM_INPUT_RENAME) {
+                    if (fm_state->selected_index >= 0 && 
+                        fm_state->selected_index < fm_state->file_count) {
+                        
+                        file_entry_t* entry = &fm_state->files[fm_state->selected_index];
+                        if (strcmp(entry->name, "..") != 0) {
+                            char full_path[128];
+                            if (strcmp(fm_state->current_path, "/") == 0) {
+                                snprintf(full_path, sizeof(full_path), "/%s", entry->name);
+                            } else {
+                                snprintf(full_path, sizeof(full_path), "%s/%s", 
+                                        fm_state->current_path, entry->name);
+                            }
+                            
+                            if (fs_rename(full_path, target_name)) {
+                                success = true;
+                            }
+                        }
+                    }
+                } else if (fm_state->input_action == FM_INPUT_NEW_FILE) {
+                    char full_path[128];
+                    if (strcmp(fm_state->current_path, "/") == 0) {
+                        snprintf(full_path, sizeof(full_path), "/%s", target_name);
+                    } else {
+                        snprintf(full_path, sizeof(full_path), "%s/%s", 
+                                fm_state->current_path, target_name);
+                    }
+                    
+                    if (fs_create_file(full_path) >= 0) {
+                        fs_write_file(full_path, (const uint8_t*)"", 0, 0);
+                        success = true;
+                    }
+                } else if (fm_state->input_action == FM_INPUT_NEW_FOLDER) {
+                    char full_path[128];
+                    if (strcmp(fm_state->current_path, "/") == 0) {
+                        snprintf(full_path, sizeof(full_path), "/%s", target_name);
+                    } else {
+                        snprintf(full_path, sizeof(full_path), "%s/%s", 
+                                fm_state->current_path, target_name);
+                    }
+                    
+                    if (fs_create_dir(full_path) >= 0) {
+                        success = true;
+                    }
                 }
                 
-                if (fs_rename(full_path, fm_state->input_buffer)) {
-                    fm_state->selected_index = -1;
+                if (success) {
                     fm_refresh_file_list();
+                    fm_select_by_name(target_name);
+                } else {
+                    exit_input = false;
                 }
             }
             
-            // Exit input mode
-            fm_state->input_mode = false;
-            fm_state->input_buffer[0] = '\0';
-            fm_state->input_cursor = 0;
-            
-            fm_draw_toolbar();
-            fm_draw_file_list();
-            fm_draw_status_bar();
-            window_draw(window);
+            if (exit_input) {
+                fm_state->input_mode = false;
+                fm_state->input_action = FM_INPUT_NONE;
+                fm_state->input_buffer[0] = '\0';
+                fm_state->input_cursor = 0;
+                
+                fm_draw_toolbar();
+                fm_draw_file_list();
+                fm_draw_status_bar();
+                window_draw(window);
+            } else {
+                fm_draw_status_bar();
+                window_draw(window);
+            }
             return;
         } else if (key == 27) {
             // ESC - cancel
             fm_state->input_mode = false;
+            fm_state->input_action = FM_INPUT_NONE;
             fm_state->input_buffer[0] = '\0';
             fm_state->input_cursor = 0;
             
@@ -668,6 +739,7 @@ void file_manager_app(void) {
     fm_state->selected_index = -1;
     fm_state->scroll_offset = 0;
     fm_state->input_mode = false;
+    fm_state->input_action = FM_INPUT_NONE;
     fm_state->input_buffer[0] = '\0';
     fm_state->input_cursor = 0;
     

@@ -11,6 +11,7 @@
 
 extern void* isr_stub_table[];
 extern void* irq_stub_table[];
+extern void syscall_stub(void);
 
 static bool vectors[IDT_MAX_DESCRIPTORS];
 
@@ -65,6 +66,9 @@ void idt_init() {
     for (uint8_t irq = 0; irq < 16; irq++) {
         idt_set_descriptor(0x20 + irq, irq_stub_table[irq], 0x8E);
     }
+
+    // System call gate (int 0x80, ring 3) - trap gate keeps IF enabled
+    idt_set_descriptor(0x80, syscall_stub, 0xEF);
 
     __asm__ volatile ("lidt %0" : : "m"(idtr)); // load the new IDT
     __asm__ volatile ("sti"); // set the interrupt flag

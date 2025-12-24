@@ -27,8 +27,7 @@ static inline void ata_write_reg(uint16_t base, uint8_t reg, uint8_t value) {
 // Wait for BSY to clear
 bool ata_wait_ready(uint16_t base) {
     uint8_t status;
-    // Wait with faster polling
-    for (int i = 0; i < 1000; i++) {
+    for (int i = 0; i < 100000; i++) {
         status = ata_read_reg(base, ATA_REG_STATUS);
         if (!(status & ATA_SR_BSY)) {
             return true;
@@ -40,11 +39,13 @@ bool ata_wait_ready(uint16_t base) {
 // Wait for DRQ to be set
 bool ata_wait_drq(uint16_t base) {
     uint8_t status;
-    // Wait with faster polling
-    for (int i = 0; i < 1000; i++) {
+    for (int i = 0; i < 100000; i++) {
         status = ata_read_reg(base, ATA_REG_STATUS);
         if (status & ATA_SR_DRQ) {
             return true;
+        }
+        if (status & ATA_SR_ERR) {
+            return false;
         }
     }
     return false;
