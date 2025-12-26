@@ -7,10 +7,11 @@
 // Simple filesystem layout:
 // Sector 0: Superblock
 // Sector 1-N: Inode table
-// Sector N+1-M: Data blocks
+// Sector N+1-K: Block bitmap
+// Sector K+1-M: Data blocks
 
 #define FS_MAGIC 0x524F4853  // "ROHS" - RohanOS
-#define FS_VERSION 1
+#define FS_VERSION 2
 #define FS_BLOCK_SIZE 512
 #define FS_MAX_INODES 256
 #define FS_MAX_FILENAME 28
@@ -30,7 +31,9 @@ typedef struct {
     uint32_t free_blocks;        // Number of free data blocks
     uint32_t free_inodes;        // Number of free inodes
     uint32_t first_data_block;   // First data block number
-    uint8_t reserved[476];       // Pad to 512 bytes
+    uint32_t bitmap_start;       // First bitmap block number
+    uint32_t bitmap_blocks;      // Number of bitmap blocks
+    uint8_t reserved[468];       // Pad to 512 bytes
 } __attribute__((packed)) fs_superblock_t;
 
 // Filesystem inode
@@ -54,6 +57,16 @@ typedef struct {
     uint8_t drive;               // ATA drive number
     fs_superblock_t superblock;  // Cached superblock
     bool mounted;                // Is filesystem mounted?
+    bool superblock_dirty;       // Track pending superblock updates
+    bool defer_superblock_flush; // Defer superblock flush during bulk writes
+    uint8_t *block_bitmap;       // In-memory bitmap for data blocks
+    uint32_t bitmap_bytes;       // Size of bitmap in bytes
+    uint32_t bitmap_bits;        // Number of data blocks tracked
+    uint32_t next_free_block;    // Hint index for next free block search
+    uint8_t *bitmap_dirty;       // Dirty flags per bitmap block
+    uint32_t bitmap_dirty_bytes; // Size of dirty flag array
+    bool defer_bitmap_flush;     // Defer bitmap flush during bulk writes
+    uint16_t next_free_inode;    // Hint index for next free inode search
 } fs_context_t;
 
 // Initialize filesystem driver

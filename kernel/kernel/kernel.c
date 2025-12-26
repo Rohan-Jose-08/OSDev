@@ -7,14 +7,18 @@
 #include <kernel/keyboard.h>
 #include <kernel/mouse.h>
 #include <kernel/shell.h>
+#include <kernel/pic.h>
 #include <kernel/graphics.h>
 #include <kernel/timer.h>
 #include <kernel/task.h>
 #include <kernel/ata.h>
 #include <kernel/fs.h>
 #include <kernel/kmalloc.h>
+#include <kernel/cpu.h>
 #include <kernel/gdt.h>
+#include <kernel/kpti.h>
 #include <kernel/user_programs.h>
+#include <kernel/process.h>
 
 #include <stdint.h>
 #include <stddef.h> 
@@ -37,6 +41,7 @@ extern const uint8_t _binary_touch_elf_start[];
 extern const uint8_t _binary_touch_elf_end[];
 extern const uint8_t _binary_pwd_elf_start[];
 extern const uint8_t _binary_pwd_elf_end[];
+
 extern const uint8_t _binary_echo_elf_start[];
 extern const uint8_t _binary_echo_elf_end[];
 extern const uint8_t _binary_reverse_elf_start[];
@@ -105,6 +110,8 @@ extern const uint8_t _binary_theme_elf_start[];
 extern const uint8_t _binary_theme_elf_end[];
 extern const uint8_t _binary_beep_elf_start[];
 extern const uint8_t _binary_beep_elf_end[];
+extern const uint8_t _binary_soundtest_elf_start[];
+extern const uint8_t _binary_soundtest_elf_end[];
 extern const uint8_t _binary_halt_elf_start[];
 extern const uint8_t _binary_halt_elf_end[];
 extern const uint8_t _binary_run_elf_start[];
@@ -127,6 +134,14 @@ extern const uint8_t _binary_guifilemgr_elf_start[];
 extern const uint8_t _binary_guifilemgr_elf_end[];
 extern const uint8_t _binary_desktop_elf_start[];
 extern const uint8_t _binary_desktop_elf_end[];
+extern const uint8_t _binary_forktest_elf_start[];
+extern const uint8_t _binary_forktest_elf_end[];
+extern const uint8_t _binary_schedtest_elf_start[];
+extern const uint8_t _binary_schedtest_elf_end[];
+extern const uint8_t _binary_fault_elf_start[];
+extern const uint8_t _binary_fault_elf_end[];
+extern const uint8_t _binary_abi_test_elf_start[];
+extern const uint8_t _binary_abi_test_elf_end[];
 
 typedef struct {
     const char *path;
@@ -224,6 +239,7 @@ static const embedded_program_t embedded_programs[] = {
     {"/bin/aliases.elf", _binary_aliases_elf_start, _binary_aliases_elf_end},
     {"/bin/theme.elf", _binary_theme_elf_start, _binary_theme_elf_end},
     {"/bin/beep.elf", _binary_beep_elf_start, _binary_beep_elf_end},
+    {"/bin/soundtest.elf", _binary_soundtest_elf_start, _binary_soundtest_elf_end},
     {"/bin/halt.elf", _binary_halt_elf_start, _binary_halt_elf_end},
     {"/bin/run.elf", _binary_run_elf_start, _binary_run_elf_end},
     {"/bin/rmdir.elf", _binary_rmdir_elf_start, _binary_rmdir_elf_end},
@@ -235,6 +251,10 @@ static const embedded_program_t embedded_programs[] = {
     {"/bin/guicalc.elf", _binary_guicalc_elf_start, _binary_guicalc_elf_end},
     {"/bin/guifilemgr.elf", _binary_guifilemgr_elf_start, _binary_guifilemgr_elf_end},
     {"/bin/desktop.elf", _binary_desktop_elf_start, _binary_desktop_elf_end},
+    {"/bin/forktest.elf", _binary_forktest_elf_start, _binary_forktest_elf_end},
+    {"/bin/schedtest.elf", _binary_schedtest_elf_start, _binary_schedtest_elf_end},
+    {"/bin/fault.elf", _binary_fault_elf_start, _binary_fault_elf_end},
+    {"/bin/abi_test.elf", _binary_abi_test_elf_start, _binary_abi_test_elf_end},
 };
 
 static int embedded_program_count(void) {
@@ -318,14 +338,19 @@ static inline bool are_interrupts_enabled()
 }
 
 void kernel_main(void) {   
+	__asm__ volatile ("cli"); // Keep interrupts off until IDT is installed.
 
 	terminal_initialize();
     
-    // Initialize kernel heap early
-    kmalloc_init();
-    
 	gdt_init();
     page_init();
+	kpti_init();
+	write_cr0(read_cr0() | CR0_WP);
+
+	// Initialize kernel heap after paging is ready
+	kmalloc_init();
+	process_init();
+    
 	idt_init();
     timer_init(100); // Initialize timer at 100 Hz (10ms per tick)
     scheduler_init(); // Initialize task scheduler
@@ -334,6 +359,13 @@ void kernel_main(void) {
     graphics_init();
     ata_init();
     fs_init();
+	idt_init();
+	pic_disable();
+	__asm__ volatile ("sti");
+	IRQ_clear_mask(0);  // Timer
+	IRQ_clear_mask(1);  // Keyboard
+	IRQ_clear_mask(2);  // Cascade (needed for IRQ12)
+	IRQ_clear_mask(12); // Mouse
 
     
 

@@ -259,6 +259,12 @@ void uwm_window_print(uwm_window_t* win, int x, int y, const char* str, uint8_t 
 	graphics_print(win->client_x + x, win->client_y + y, str, fg, bg);
 }
 
+void uwm_window_blit(uwm_window_t* win, int x, int y, int width, int height,
+                     const uint8_t* buffer, int stride) {
+	if (!win || !buffer) return;
+	graphics_blit(win->client_x + x, win->client_y + y, width, height, buffer, stride);
+}
+
 void uwm_quit(void) {
 	uwm_running = false;
 }
@@ -267,6 +273,7 @@ void uwm_run(void) {
 	int cursor_x = graphics_get_width() / 2;
 	int cursor_y = graphics_get_height() / 2;
 	uint8_t prev_buttons = 0;
+	bool needs_redraw = true;
 
 	uwm_running = true;
 	while (uwm_running) {
@@ -275,6 +282,8 @@ void uwm_run(void) {
 			continue;
 		}
 
+		int prev_x = cursor_x;
+		int prev_y = cursor_y;
 		cursor_x += state.x;
 		cursor_y -= state.y;
 		if (cursor_x < 0) cursor_x = 0;
@@ -282,26 +291,13 @@ void uwm_run(void) {
 		if (cursor_x > graphics_get_width() - 2) cursor_x = graphics_get_width() - 2;
 		if (cursor_y > graphics_get_height() - 2) cursor_y = graphics_get_height() - 2;
 
-		if (background_draw) {
-			background_draw(NULL);
-		} else {
-			graphics_clear(COLOR_LIGHT_CYAN);
-		}
-
-		for (int i = 0; i < window_count; i++) {
-			draw_window(window_order[i]);
-		}
-
-		if (overlay_draw) {
-			overlay_draw(NULL);
-		}
-
-		graphics_draw_rect(cursor_x, cursor_y, 5, 5, COLOR_WHITE);
-		graphics_flip_buffer();
-
 		uint8_t buttons = state.buttons;
 		int left_down = (buttons & MOUSE_LEFT_BUTTON) && !(prev_buttons & MOUSE_LEFT_BUTTON);
 		int left_up = !(buttons & MOUSE_LEFT_BUTTON) && (prev_buttons & MOUSE_LEFT_BUTTON);
+		if (cursor_x != prev_x || cursor_y != prev_y || buttons != prev_buttons ||
+		    state.scroll != 0) {
+			needs_redraw = true;
+		}
 
 		uwm_window_t* active = NULL;
 		for (int i = window_count - 1; i >= 0; i--) {
@@ -310,36 +306,50 @@ void uwm_run(void) {
 				break;
 			}
 		}
-		bool capture = !active && background_capture && background_capture(cursor_x, cursor_y);
+		bool capture = background_capture && background_capture(cursor_x, cursor_y);
 
-		if (left_down && active) {
-			focus_window(active);
-			if (point_in_close(active, cursor_x, cursor_y)) {
-				uwm_window_destroy(active);
-			} else if (point_in_title(active, cursor_x, cursor_y)) {
-				active->dragging = true;
-				active->drag_dx = cursor_x - active->x;
-				active->drag_dy = cursor_y - active->y;
-			} else if (active->on_mouse_down) {
-				int cx = cursor_x - active->client_x;
-				int cy = cursor_y - active->client_y;
-				active->on_mouse_down(active, cx, cy, buttons);
+		if (left_down) {
+			needs_redraw = true;
+			if (capture) {
+				if (background_mouse_down) {
+					background_mouse_down(NULL, cursor_x, cursor_y, buttons);
+				}
+			} else if (active) {
+				focus_window(active);
+				if (point_in_close(active, cursor_x, cursor_y)) {
+					uwm_window_destroy(active);
+				} else if (point_in_title(active, cursor_x, cursor_y)) {
+					active->dragging = true;
+					active->drag_dx = cursor_x - active->x;
+					active->drag_dy = cursor_y - active->y;
+				} else if (active->on_mouse_down) {
+					int cx = cursor_x - active->client_x;
+					int cy = cursor_y - active->client_y;
+					active->on_mouse_down(active, cx, cy, buttons);
+				}
+			} else if (background_mouse_down) {
+				background_mouse_down(NULL, cursor_x, cursor_y, buttons);
 			}
-		} else if (left_down && background_mouse_down) {
-			background_mouse_down(NULL, cursor_x, cursor_y, buttons);
 		}
 
-		if (left_up && active) {
-			if (active->dragging) {
-				active->dragging = false;
+		if (left_up) {
+			needs_redraw = true;
+			if (capture) {
+				if (background_mouse_up) {
+					background_mouse_up(NULL, cursor_x, cursor_y, buttons);
+				}
+			} else if (active) {
+				if (active->dragging) {
+					active->dragging = false;
+				}
+				if (active->on_mouse_up) {
+					int cx = cursor_x - active->client_x;
+					int cy = cursor_y - active->client_y;
+					active->on_mouse_up(active, cx, cy, buttons);
+				}
+			} else if (background_mouse_up) {
+				background_mouse_up(NULL, cursor_x, cursor_y, buttons);
 			}
-			if (active->on_mouse_up) {
-				int cx = cursor_x - active->client_x;
-				int cy = cursor_y - active->client_y;
-				active->on_mouse_up(active, cx, cy, buttons);
-			}
-		} else if (left_up && background_mouse_up) {
-			background_mouse_up(NULL, cursor_x, cursor_y, buttons);
 		}
 
 		for (int i = 0; i < window_count; i++) {
@@ -348,24 +358,29 @@ void uwm_run(void) {
 				win->x = cursor_x - win->drag_dx;
 				win->y = cursor_y - win->drag_dy;
 				recompute_client(win);
+				needs_redraw = true;
 			} else if (!capture && win->focused && win->on_mouse_move &&
 			           point_in_window(win, cursor_x, cursor_y)) {
 				int cx = cursor_x - win->client_x;
 				int cy = cursor_y - win->client_y;
 				win->on_mouse_move(win, cx, cy, buttons);
+				needs_redraw = true;
 			}
 
 			if (!capture && state.scroll != 0 && win->focused && win->on_scroll &&
 			    point_in_window(win, cursor_x, cursor_y)) {
 				win->on_scroll(win, state.scroll);
+				needs_redraw = true;
 			}
 		}
 
 		if ((capture || !active) && background_mouse_move) {
 			background_mouse_move(NULL, cursor_x, cursor_y, buttons);
+			needs_redraw = true;
 		}
 		if ((capture || !active) && state.scroll != 0 && background_scroll) {
 			background_scroll(NULL, state.scroll);
+			needs_redraw = true;
 		}
 
 		if (keyboard_has_input()) {
@@ -382,7 +397,28 @@ void uwm_run(void) {
 				if (background_key && (!window_count || !window_order[window_count - 1]->focused)) {
 					background_key(NULL, key);
 				}
+				needs_redraw = true;
 			}
+		}
+
+		if (needs_redraw && uwm_running) {
+			if (background_draw) {
+				background_draw(NULL);
+			} else {
+				graphics_clear(COLOR_LIGHT_CYAN);
+			}
+
+			for (int i = 0; i < window_count; i++) {
+				draw_window(window_order[i]);
+			}
+
+			if (overlay_draw) {
+				overlay_draw(NULL);
+			}
+
+			graphics_draw_rect(cursor_x, cursor_y, 5, 5, COLOR_WHITE);
+			graphics_flip_buffer();
+			needs_redraw = false;
 		}
 
 		prev_buttons = buttons;

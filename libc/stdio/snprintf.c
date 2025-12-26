@@ -157,6 +157,44 @@ int snprintf(char* buffer, size_t size, const char* format, ...) {
 				}
 			}
 		}
+		else if (*format == 'x' || *format == 'X') {
+			format++;
+			unsigned int value = va_arg(parameters, unsigned int);
+			char num_buf[32];
+			int pos = 0;
+			char base = (*(format - 1) == 'X') ? 'A' : 'a';
+
+			if (value == 0) {
+				num_buf[pos++] = '0';
+			} else {
+				while (value > 0) {
+					int digit = value % 16;
+					if (digit < 10) {
+						num_buf[pos++] = '0' + digit;
+					} else {
+						num_buf[pos++] = base + (digit - 10);
+					}
+					value /= 16;
+				}
+			}
+
+			// Handle width padding
+			if (!left_justify && width > pos) {
+				for (int i = 0; i < width - pos && written < size - 1; i++) {
+					buffer[written++] = ' ';
+				}
+			}
+
+			for (int i = pos - 1; i >= 0 && written < size - 1; i--) {
+				buffer[written++] = num_buf[i];
+			}
+
+			if (left_justify && width > pos) {
+				for (int i = 0; i < width - pos && written < size - 1; i++) {
+					buffer[written++] = ' ';
+				}
+			}
+		}
 		else {
 			format++;
 		}

@@ -12,6 +12,10 @@
 
 #define PT_LOAD 1
 
+#define PF_X 0x1
+#define PF_W 0x2
+#define PF_R 0x4
+
 // Minimum allowed user load address to avoid kernel heap.
 #define ELF_USER_LOAD_MIN 0x02000000
 
@@ -49,6 +53,6 @@ typedef struct {
 	uint32_t max_vaddr;
 } elf_image_t;
 
-bool elf_load_file(const char *path, elf_image_t *image);
+bool elf_load_file(const char *path, elf_image_t *image, uint32_t *page_dir);
 
 #endif

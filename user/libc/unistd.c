@@ -22,6 +22,22 @@ int exec(const char *path, const char *args, uint32_t args_len) {
 	return syscall3(SYSCALL_EXEC, (uint32_t)path, (uint32_t)args, args_len);
 }
 
+int spawn(const char *path, const char *args, uint32_t args_len) {
+	return syscall3(SYSCALL_SPAWN, (uint32_t)path, (uint32_t)args, args_len);
+}
+
+int fork(void) {
+	return syscall3(SYSCALL_FORK, 0, 0, 0);
+}
+
+int wait(int *status) {
+	return syscall3(SYSCALL_WAIT, (uint32_t)-1, (uint32_t)status, 0);
+}
+
+int waitpid(int pid, int *status) {
+	return syscall3(SYSCALL_WAIT, (uint32_t)pid, (uint32_t)status, 0);
+}
+
 uint32_t getargs(char *buf, uint32_t len) {
 	return (uint32_t)syscall3(SYSCALL_GETARGS, (uint32_t)buf, len, 0);
 }
@@ -122,8 +138,8 @@ int timer_status(void) {
 	return syscall3(SYSCALL_TIMER_STATUS, 0, 0, 0);
 }
 
-int beep(void) {
-	return syscall3(SYSCALL_BEEP, 0, 0, 0);
+int beep(uint32_t frequency_hz, uint32_t duration_ms) {
+	return syscall3(SYSCALL_BEEP, frequency_hz, duration_ms, 0);
 }
 
 int halt(void) {

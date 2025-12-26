@@ -22,6 +22,8 @@ extern usermode_saved_ebx
 extern usermode_saved_esi
 extern usermode_saved_edi
 extern usermode_saved_ebp
+extern kpti_prepare_return_isr
+extern trampoline_isr_return
 
 section .text
 
@@ -57,13 +59,10 @@ isr_common_stub:
     ret
 
 isr_return:
-    pop gs
-    pop fs
-    pop es
-    pop ds
-    popad
-    add esp, 8
-    iret
+    push esp
+    call kpti_prepare_return_isr
+    add esp, 4
+    jmp trampoline_isr_return
 
 isr_no_err_stub 0
 isr_no_err_stub 1

@@ -46,5 +46,7 @@ void uwm_window_draw_rect(uwm_window_t* win, int x, int y, int width, int height
 void uwm_window_fill_rect(uwm_window_t* win, int x, int y, int width, int height, uint8_t color);
 void uwm_window_draw_char(uwm_window_t* win, int x, int y, char c, uint8_t fg, uint8_t bg);
 void uwm_window_print(uwm_window_t* win, int x, int y, const char* str, uint8_t fg, uint8_t bg);
+void uwm_window_blit(uwm_window_t* win, int x, int y, int width, int height,
+                     const uint8_t* buffer, int stride);
 
 #endif

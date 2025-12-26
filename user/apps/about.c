@@ -37,7 +37,9 @@ int main(void) {
 	write_line("  [+] VGA text mode display (80x25, 16 colors)\n");
 	write_line("  [+] PS/2 keyboard input support\n");
 	write_line("  [+] Interactive shell with command processing\n");
-	write_line("  [+] Basic filesystem and user-mode apps\n\n");
+	write_line("  [+] Basic filesystem and user-mode apps\n");
+	write_line("  [+] Driver breadth: USB (HID + mass storage), PS/2 fallback,\n");
+	write_line("      ACPI/PCI enumeration, better storage (AHCI), timer/APIC\n\n");
 
 	write_line("Commands executed: ");
 	print_uint(get_command_count());

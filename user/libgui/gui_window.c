@@ -1,7 +1,7 @@
 #include <gui_window.h>
 #include <stddef.h>
 
-extern const uint8_t font_8x8[256][8];
+#define WINDOW_TEXT_TRANSPARENT 0xFF
 
 int window_content_width(window_t* win) {
 	return uwm_window_client_width(win);
@@ -40,21 +40,21 @@ void window_print(window_t* win, int x, int y, const char* text, uint8_t color) 
 	int cx = x;
 	int cy = y;
 	int max_width = window_content_width(win);
+	int max_height = window_content_height(win);
 
 	while (*text) {
 		if (*text == '\n') {
 			cx = x;
 			cy += 8;
 		} else {
-			const uint8_t* glyph = font_8x8[(uint8_t)*text];
-			for (int row = 0; row < 8; row++) {
-				uint8_t bits = glyph[row];
-				for (int col = 0; col < 8; col++) {
-					if (bits & (1u << (7 - col))) {
-						window_putpixel(win, cx + col, cy + row, color);
-					}
-				}
+			if (cx + 8 > max_width) {
+				cx = x;
+				cy += 8;
 			}
+			if (cy + 8 > max_height) {
+				break;
+			}
+			uwm_window_draw_char(win, cx, cy, *text, color, WINDOW_TEXT_TRANSPARENT);
 			cx += 8;
 		}
 
@@ -64,4 +64,12 @@ void window_print(window_t* win, int x, int y, const char* text, uint8_t color) 
 			cy += 8;
 		}
 	}
+}
+
+void window_blit(window_t* win, int x, int y, int width, int height,
+                 const uint8_t* buffer, int stride) {
+	if (!win || !buffer || width <= 0 || height <= 0) {
+		return;
+	}
+	uwm_window_blit(win, x, y, width, height, buffer, stride);
 }

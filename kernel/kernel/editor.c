@@ -6,6 +6,7 @@
 #include <kernel/tty.h>
 #include <kernel/keyboard.h>
 #include <kernel/fs.h>
+#include <kernel/memory.h>
 
 #define MAX_LINES 100
 #define MAX_LINE_LENGTH 80
@@ -128,7 +129,7 @@ static inline const EditorCommand* cmd_lookup(unsigned char key) {
 
 static void editor_redraw(void) {
 	// Write directly to VGA buffer to avoid flicker
-	volatile uint16_t* vga = (volatile uint16_t*)0xB8000;
+	volatile uint16_t* vga = (volatile uint16_t*)KERNEL_PHYS_TO_VIRT(0xB8000);
 	uint8_t normal_color = vga_entry_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 	uint8_t cursor_color = vga_entry_color(VGA_COLOR_BLACK, VGA_COLOR_LIGHT_GREY);
 	uint8_t status_color = vga_entry_color(VGA_COLOR_BLACK, VGA_COLOR_LIGHT_GREY);

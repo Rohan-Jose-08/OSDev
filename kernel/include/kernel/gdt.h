@@ -2,6 +2,7 @@
 #define _KERNEL_GDT_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 // GDT selectors
 #define GDT_KERNEL_CODE 0x08
@@ -15,5 +16,9 @@ void gdt_init(void);
 
 // Update kernel stack used on ring transitions.
 void tss_set_kernel_stack(uint32_t stack_top);
+
+// Expose descriptor tables for KPTI mapping.
+void gdt_get_range(uintptr_t *base, size_t *size);
+void tss_get_range(uintptr_t *base, size_t *size);
 
 #endif

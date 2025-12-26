@@ -42,6 +42,8 @@ typedef struct {
 	int menu_width;
 	int menu_height;
 	int menu_hover_item;
+	int icon_hover_item;
+	bool start_hover;
 	desktop_app_t apps[DESKTOP_MAX_APPS];
 	int app_count;
 } desktop_state_t;
@@ -56,14 +58,23 @@ static void desktop_launch_editor(void);
 static void desktop_layout_icons(void) {
 	int screen_height = graphics_get_height();
 	int available = screen_height - DESKTOP_TASKBAR_HEIGHT - 8;
-	int spacing = desktop.app_count ? (available / desktop.app_count) : 0;
-	if (spacing < DESKTOP_ICON_SIZE + DESKTOP_ICON_PADDING) {
-		spacing = DESKTOP_ICON_SIZE + DESKTOP_ICON_PADDING;
+	int min_spacing = DESKTOP_ICON_SIZE + DESKTOP_ICON_PADDING;
+	if (desktop.app_count == 0) {
+		return;
 	}
+	int icons_per_col = available / min_spacing;
+	if (icons_per_col < 1) icons_per_col = 1;
+	if (icons_per_col > desktop.app_count) icons_per_col = desktop.app_count;
 
+	int spacing = available / icons_per_col;
+	if (spacing < min_spacing) spacing = min_spacing;
+
+	int col_spacing = min_spacing;
 	for (int i = 0; i < desktop.app_count; i++) {
-		desktop.apps[i].icon_x = 4;
-		desktop.apps[i].icon_y = 4 + i * spacing;
+		int col = i / icons_per_col;
+		int row = i % icons_per_col;
+		desktop.apps[i].icon_x = 4 + col * col_spacing;
+		desktop.apps[i].icon_y = 4 + row * spacing;
 	}
 }
 
@@ -86,6 +97,8 @@ static void desktop_init(void) {
 	desktop.menu_open = false;
 	desktop.menu_width = 120;
 	desktop.menu_hover_item = -1;
+	desktop.icon_hover_item = -1;
+	desktop.start_hover = false;
 
 	desktop_register_app("Calculator", desktop_launch_calc);
 	desktop_register_app("Paint", desktop_launch_paint);
@@ -120,10 +133,12 @@ static void desktop_draw_taskbar(void) {
 	int screen_width = graphics_get_width();
 	int screen_height = graphics_get_height();
 	int taskbar_y = screen_height - DESKTOP_TASKBAR_HEIGHT;
+	uint8_t start_bg = (desktop.menu_open || desktop.start_hover) ? DESKTOP_COLOR_MENU_HOVER
+	                                                             : DESKTOP_COLOR_ICON_BG;
 
 	graphics_fill_rect(0, taskbar_y, screen_width, DESKTOP_TASKBAR_HEIGHT, DESKTOP_COLOR_TASKBAR);
-	graphics_fill_rect(2, taskbar_y + 2, 50, DESKTOP_TASKBAR_HEIGHT - 4, DESKTOP_COLOR_ICON_BG);
-	graphics_print(6, taskbar_y + 6, "Start", DESKTOP_COLOR_ICON_TEXT, DESKTOP_COLOR_ICON_BG);
+	graphics_fill_rect(2, taskbar_y + 2, 50, DESKTOP_TASKBAR_HEIGHT - 4, start_bg);
+	graphics_print(6, taskbar_y + 6, "Start", DESKTOP_COLOR_ICON_TEXT, start_bg);
 }
 
 static void desktop_draw_icons(void) {
@@ -131,15 +146,16 @@ static void desktop_draw_icons(void) {
 		desktop_app_t* app = &desktop.apps[i];
 		if (!app->visible) continue;
 
-		graphics_fill_rect(app->icon_x, app->icon_y, DESKTOP_ICON_SIZE, DESKTOP_ICON_SIZE,
-		                   DESKTOP_COLOR_ICON_BG);
+		uint8_t bg = (i == desktop.icon_hover_item) ? COLOR_WHITE : DESKTOP_COLOR_ICON_BG;
+		uint8_t border = (i == desktop.icon_hover_item) ? COLOR_LIGHT_BLUE : COLOR_DARK_GRAY;
+		graphics_fill_rect(app->icon_x, app->icon_y, DESKTOP_ICON_SIZE, DESKTOP_ICON_SIZE, bg);
 		graphics_draw_rect(app->icon_x, app->icon_y, DESKTOP_ICON_SIZE, DESKTOP_ICON_SIZE,
-		                   COLOR_DARK_GRAY);
+		                   border);
 
 		char icon_char[2] = {app->name[0], '\0'};
 		int text_x = app->icon_x + DESKTOP_ICON_SIZE / 2 - 4;
 		int text_y = app->icon_y + DESKTOP_ICON_SIZE / 2 - 4;
-		graphics_print(text_x, text_y, icon_char, COLOR_BLUE, DESKTOP_COLOR_ICON_BG);
+		graphics_print(text_x, text_y, icon_char, COLOR_BLUE, bg);
 
 		int name_y = app->icon_y + DESKTOP_ICON_SIZE + 2;
 		graphics_print(app->icon_x, name_y, app->name, DESKTOP_COLOR_ICON_TEXT,
@@ -174,6 +190,10 @@ static void desktop_draw_background(uwm_window_t* win) {
 	                   graphics_get_height() - DESKTOP_TASKBAR_HEIGHT,
 	                   DESKTOP_COLOR_BACKGROUND);
 	desktop_draw_icons();
+}
+
+static void desktop_draw_overlay(uwm_window_t* win) {
+	(void)win;
 	desktop_draw_taskbar();
 	desktop_draw_menu();
 }
@@ -182,6 +202,11 @@ static bool desktop_point_in_taskbar(int x, int y) {
 	(void)x;
 	int taskbar_y = graphics_get_height() - DESKTOP_TASKBAR_HEIGHT;
 	return y >= taskbar_y;
+}
+
+static bool desktop_point_in_start_button(int x, int y) {
+	if (!desktop_point_in_taskbar(x, y)) return false;
+	return x >= 2 && x < 52;
 }
 
 static bool desktop_point_in_menu(int x, int y) {
@@ -207,24 +232,40 @@ static void desktop_launch_app(int index) {
 	}
 }
 
+static void desktop_open_menu(void) {
+	desktop.menu_open = true;
+	desktop.menu_hover_item = -1;
+	desktop.icon_hover_item = -1;
+	desktop.menu_x = 2;
+	int max_x = graphics_get_width() - desktop.menu_width - 2;
+	if (max_x < 0) max_x = 0;
+	if (desktop.menu_x > max_x) desktop.menu_x = max_x;
+	desktop.menu_y = graphics_get_height() - DESKTOP_TASKBAR_HEIGHT - desktop.menu_height;
+	if (desktop.menu_y < 0) desktop.menu_y = 0;
+}
+
 static void desktop_handle_click(int x, int y) {
 	if (desktop_point_in_taskbar(x, y)) {
-		if (x >= 2 && x < 52) {
-			desktop.menu_open = !desktop.menu_open;
+		if (desktop_point_in_start_button(x, y)) {
 			if (desktop.menu_open) {
-				desktop.menu_x = 2;
-				desktop.menu_y = graphics_get_height() - DESKTOP_TASKBAR_HEIGHT - desktop.menu_height;
+				desktop.menu_open = false;
+			} else {
+				desktop_open_menu();
 			}
+		} else if (desktop.menu_open) {
+			desktop.menu_open = false;
 		}
 		return;
 	}
 
-	if (desktop.menu_open && desktop_point_in_menu(x, y)) {
-		int item = desktop_get_menu_item_at(x, y);
-		if (item >= 0) {
-			desktop_launch_app(item);
-			desktop.menu_open = false;
+	if (desktop.menu_open) {
+		if (desktop_point_in_menu(x, y)) {
+			int item = desktop_get_menu_item_at(x, y);
+			if (item >= 0) {
+				desktop_launch_app(item);
+			}
 		}
+		desktop.menu_open = false;
 		return;
 	}
 
@@ -238,21 +279,37 @@ static void desktop_handle_click(int x, int y) {
 		}
 	}
 
-	if (desktop.menu_open) {
-		desktop.menu_open = false;
-	}
+	desktop.menu_open = false;
 }
 
 static void desktop_handle_mouse_move(int x, int y) {
+	desktop.start_hover = desktop_point_in_start_button(x, y);
+
 	if (desktop.menu_open) {
 		desktop.menu_hover_item = desktop_get_menu_item_at(x, y);
 	} else {
 		desktop.menu_hover_item = -1;
 	}
+
+	desktop.icon_hover_item = -1;
+	if (!desktop.menu_open && !desktop_point_in_taskbar(x, y)) {
+		for (int i = 0; i < desktop.app_count; i++) {
+			desktop_app_t* app = &desktop.apps[i];
+			if (!app->visible) continue;
+			if (x >= app->icon_x && x < app->icon_x + DESKTOP_ICON_SIZE &&
+			    y >= app->icon_y && y < app->icon_y + DESKTOP_ICON_SIZE) {
+				desktop.icon_hover_item = i;
+				break;
+			}
+		}
+	}
 }
 
 static bool desktop_capture(int x, int y) {
-	return desktop_point_in_taskbar(x, y) || desktop_point_in_menu(x, y);
+	if (desktop.menu_open) {
+		return true;
+	}
+	return desktop_point_in_taskbar(x, y);
 }
 
 static void desktop_on_mouse_down(uwm_window_t* win, int x, int y, int buttons) {
@@ -295,6 +352,7 @@ int gui_run_desktop(void) {
 
 	desktop_init();
 	uwm_set_background(desktop_draw_background);
+	uwm_set_overlay(desktop_draw_overlay);
 	uwm_set_background_input(desktop_on_mouse_down, NULL, desktop_on_mouse_move,
 	                         NULL, NULL, desktop_capture);
 	uwm_run();

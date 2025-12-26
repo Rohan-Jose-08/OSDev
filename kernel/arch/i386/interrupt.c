@@ -12,6 +12,9 @@
 extern void* isr_stub_table[];
 extern void* irq_stub_table[];
 extern void syscall_stub(void);
+extern void* trampoline_isr_stub_table[];
+extern void* trampoline_irq_stub_table[];
+extern void trampoline_syscall_stub(void);
 
 static bool vectors[IDT_MAX_DESCRIPTORS];
 
@@ -55,7 +58,7 @@ void idt_init() {
 
     // Set up exception handlers (0-31)
     for (uint8_t vector = 0; vector < 32; vector++) {
-        idt_set_descriptor(vector, isr_stub_table[vector], 0x8E);
+        idt_set_descriptor(vector, trampoline_isr_stub_table[vector], 0x8E);
         vectors[vector] = true;
     }
 
@@ -64,12 +67,20 @@ void idt_init() {
 
     // Set up IRQ handlers (32-47 after remapping)
     for (uint8_t irq = 0; irq < 16; irq++) {
-        idt_set_descriptor(0x20 + irq, irq_stub_table[irq], 0x8E);
+        idt_set_descriptor(0x20 + irq, trampoline_irq_stub_table[irq], 0x8E);
     }
 
     // System call gate (int 0x80, ring 3) - trap gate keeps IF enabled
-    idt_set_descriptor(0x80, syscall_stub, 0xEF);
+    idt_set_descriptor(0x80, trampoline_syscall_stub, 0xEF);
 
     __asm__ volatile ("lidt %0" : : "m"(idtr)); // load the new IDT
-    __asm__ volatile ("sti"); // set the interrupt flag
+}
+
+void idt_get_range(uintptr_t *base, size_t *size) {
+	if (base) {
+		*base = (uintptr_t)&idt[0];
+	}
+	if (size) {
+		*size = sizeof(idt);
+	}
 }

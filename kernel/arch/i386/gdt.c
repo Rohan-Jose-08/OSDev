@@ -1,5 +1,4 @@
 #include <kernel/gdt.h>
-#include <stdio.h>
 #include <string.h>
 
 typedef struct {
@@ -82,10 +81,26 @@ void gdt_init(void) {
 	gdt_flush((uint32_t)&gdt_ptr);
 
 	__asm__ volatile ("ltr %0" : : "r"((uint16_t)GDT_TSS));
-
-	printf("GDT: initialized (user segments + TSS)\n");
 }
 
 void tss_set_kernel_stack(uint32_t stack_top) {
 	tss_entry.esp0 = stack_top;
+}
+
+void gdt_get_range(uintptr_t *base, size_t *size) {
+	if (base) {
+		*base = (uintptr_t)&gdt_entries;
+	}
+	if (size) {
+		*size = sizeof(gdt_entries);
+	}
+}
+
+void tss_get_range(uintptr_t *base, size_t *size) {
+	if (base) {
+		*base = (uintptr_t)&tss_entry;
+	}
+	if (size) {
+		*size = sizeof(tss_entry);
+	}
 }

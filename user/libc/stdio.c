@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -51,6 +52,31 @@ static void buf_put_uint(char *buf, unsigned int size, unsigned int *pos, unsign
 	}
 }
 
+static void buf_put_hex(char *buf, unsigned int size, unsigned int *pos, unsigned int value, bool upper) {
+	char tmp[16];
+	int idx = 0;
+	char base = upper ? 'A' : 'a';
+
+	if (value == 0) {
+		buf_putc(buf, size, pos, '0');
+		return;
+	}
+
+	while (value > 0 && idx < (int)sizeof(tmp)) {
+		unsigned int digit = value % 16;
+		if (digit < 10) {
+			tmp[idx++] = (char)('0' + digit);
+		} else {
+			tmp[idx++] = (char)(base + (digit - 10));
+		}
+		value /= 16;
+	}
+
+	for (int i = idx - 1; i >= 0; i--) {
+		buf_putc(buf, size, pos, tmp[i]);
+	}
+}
+
 static void buf_put_int(char *buf, unsigned int size, unsigned int *pos, int value) {
 	if (value < 0) {
 		buf_putc(buf, size, pos, '-');
@@ -89,6 +115,9 @@ int snprintf(char *buf, unsigned int size, const char *fmt, ...) {
 		} else if (*fmt == 'u') {
 			unsigned int v = va_arg(args, unsigned int);
 			buf_put_uint(buf, size, &pos, v);
+		} else if (*fmt == 'x' || *fmt == 'X') {
+			unsigned int v = va_arg(args, unsigned int);
+			buf_put_hex(buf, size, &pos, v, *fmt == 'X');
 		} else {
 			buf_putc(buf, size, &pos, '%');
 			buf_putc(buf, size, &pos, *fmt);

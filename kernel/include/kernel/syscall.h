@@ -2,6 +2,7 @@
 #define _KERNEL_SYSCALL_H
 
 #include <stdint.h>
+#include <kernel/trap_frame.h>
 
 // Syscall numbers
 #define SYSCALL_WRITE 1
@@ -62,12 +63,12 @@
 #define SYSCALL_MOUSE_GET_STATE 56
 #define SYSCALL_KEYBOARD_HAS_INPUT 57
 #define SYSCALL_RENAME 58
+#define SYSCALL_SPAWN 59
+#define SYSCALL_WAIT 60
+#define SYSCALL_FORK 61
+#define SYSCALL_GFX_BLIT 62
 
-typedef struct {
-	uint32_t gs, fs, es, ds;
-	uint32_t edi, esi, ebp, esp, ebx, edx, ecx, eax;
-	uint32_t eip, cs, eflags, useresp, userss;
-} __attribute__((packed)) syscall_frame_t;
+typedef trap_frame_t syscall_frame_t;
 
 void syscall_dispatch(syscall_frame_t *frame);
 void syscall_reset_exit(void);
@@ -75,6 +76,7 @@ uint32_t syscall_exit_status(void);
 
 // Used by assembly stubs.
 extern volatile uint32_t syscall_exit_requested;
+extern volatile uint32_t syscall_exit_code;
 extern volatile uint32_t usermode_return_esp;
 extern volatile uint32_t usermode_saved_ebx;
 extern volatile uint32_t usermode_saved_esi;

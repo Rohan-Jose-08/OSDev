@@ -8,6 +8,8 @@
 .extern usermode_saved_esi
 .extern usermode_saved_edi
 .extern usermode_saved_ebp
+.extern kpti_prepare_return_trap
+.extern trampoline_syscall_return
 
 syscall_stub:
 	pusha
@@ -30,12 +32,11 @@ syscall_stub:
 	test %eax, %eax
 	jnz syscall_exit
 
-	pop %gs
-	pop %fs
-	pop %es
-	pop %ds
-	popa
-	iret
+	cli
+	push %esp
+	call kpti_prepare_return_trap
+	add $4, %esp
+	jmp trampoline_syscall_return
 
 syscall_exit:
 	movl usermode_saved_ebx, %ebx

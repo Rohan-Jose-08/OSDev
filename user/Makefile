@@ -15,7 +15,7 @@ USER_CFLAGS?=-ffreestanding -fno-pic -fno-stack-protector -fno-builtin -nostdlib
 USER_CFLAGS+=-I$(INCLUDE_DIR)
 USER_LDFLAGS?=-nostdlib -Wl,-T,linker.ld -Wl,-N
 
-APPS=hello cat execdemo statdemo ls rm mkdir touch pwd echo reverse strlen upper lower calc draw banner clear color colors write history cd help about sysinfo uptime randcolor rainbow art fortune animate matrix guess rps tictactoe hangman timer alias unalias aliases theme beep halt run rmdir gfx gfxanim gfxpaint gui guipaint guicalc guifilemgr desktop
+APPS=hello cat execdemo statdemo ls rm mkdir touch pwd echo reverse strlen upper lower calc draw banner clear color colors write history cd help about sysinfo uptime randcolor rainbow art fortune animate matrix guess rps tictactoe hangman timer alias unalias aliases theme beep soundtest halt run rmdir gfx gfxanim gfxpaint gui guipaint guicalc guifilemgr desktop forktest schedtest fault abi_test
 APP_ELF=$(addsuffix .elf,$(APPS))
 APP_BLOB=$(addsuffix _blob.o,$(APPS))
 APP_OBJS=$(addprefix $(BUILD_DIR)/,$(addsuffix .o,$(APPS)))

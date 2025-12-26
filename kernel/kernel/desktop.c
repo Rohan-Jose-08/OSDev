@@ -1653,7 +1653,7 @@ static void launch_about(void) {
     int win_w = screen_w * 40 / 100;
     int win_h = screen_h * 40 / 100;
     if (win_w < 220) win_w = 220;  // Minimum size
-    if (win_h < 160) win_h = 160;
+    if (win_h < 190) win_h = 190;
     
     window_t* win = window_create(100 + (about_count * 15), 80 + (about_count * 15), 
                                    win_w, win_h, "About RohanOS");
@@ -1664,5 +1664,11 @@ static void launch_about(void) {
         window_print(win, 5, 55, "- Multi-window GUI", COLOR_DARK_GRAY);
         window_print(win, 5, 70, "- Application menu", COLOR_DARK_GRAY);
         window_print(win, 5, 85, "- Mouse support", COLOR_DARK_GRAY);
+        window_print(win, 5, 100, "Driver breadth:", COLOR_BLACK);
+        window_print(win, 5, 115, "- USB (HID + mass storage)", COLOR_DARK_GRAY);
+        window_print(win, 5, 130, "- PS/2 fallback", COLOR_DARK_GRAY);
+        window_print(win, 5, 145, "- ACPI/PCI enumeration", COLOR_DARK_GRAY);
+        window_print(win, 5, 160, "- Better storage (AHCI)", COLOR_DARK_GRAY);
+        window_print(win, 5, 175, "- Timer/APIC", COLOR_DARK_GRAY);
     }
 }

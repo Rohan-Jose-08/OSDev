@@ -4,9 +4,11 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <kernel/memory.h>
 
 // Heap configuration
-#define HEAP_START 0x00400000  // Start of heap (4MB)
+#define HEAP_PHYS_START 0x00400000  // Physical start of heap (4MB)
+#define HEAP_START (KERNEL_VIRT_BASE + HEAP_PHYS_START)
 #define HEAP_SIZE  0x01000000  // Heap size (16MB)
 #define HEAP_BLOCK_SIZE 64     // Minimum allocation unit (64 bytes)
 #define HEAP_BLOCKS (HEAP_SIZE / HEAP_BLOCK_SIZE)

@@ -199,13 +199,7 @@ static void paint_draw_canvas(window_t* win) {
     window_fill_rect(win, 0, origin_y, content_w, draw_h, COLOR_WHITE);
     int max_w = content_w < state->canvas_w ? content_w : state->canvas_w;
     int max_h = draw_h < state->canvas_h ? draw_h : state->canvas_h;
-
-    for (int y = 0; y < max_h; y++) {
-        int row = y * state->canvas_w;
-        for (int x = 0; x < max_w; x++) {
-            window_putpixel(win, x, origin_y + y, state->canvas[row + x]);
-        }
-    }
+    window_blit(win, 0, origin_y, max_w, max_h, state->canvas, state->canvas_w);
 }
 
 static int paint_read_file(const char* path, uint8_t* buffer, int max_len) {

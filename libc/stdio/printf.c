@@ -109,11 +109,12 @@ buffer[i - j - 1] = temp;
 if (!print(buffer, i))
 return -1;
 written += i;
-} else if (*format == 'X') {
+} else if (*format == 'x' || *format == 'X') {
 format++;
 unsigned int value = va_arg(parameters, unsigned int);
 char buffer[32];
 int i = 0;
+char base = (*(format - 1) == 'X') ? 'A' : 'a';
 if (value == 0) {
 buffer[i++] = '0';
 } else {
@@ -122,7 +123,7 @@ int digit = value % 16;
 if (digit < 10) {
 buffer[i++] = '0' + digit;
 } else {
-buffer[i++] = 'A' + (digit - 10);
+buffer[i++] = base + (digit - 10);
 }
 value /= 16;
 }

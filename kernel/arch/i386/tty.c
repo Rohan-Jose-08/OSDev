@@ -5,6 +5,7 @@
 
 #include <kernel/tty.h>
 #include <kernel/io.h>
+#include <kernel/memory.h>
 #include "vga.h"
 
 // External 8x8 font
@@ -13,7 +14,7 @@ extern const uint8_t font_8x8[256][8];
 // Display modes
 static size_t VGA_WIDTH = 80;
 static size_t VGA_HEIGHT = 25;
-static uint16_t* const VGA_MEMORY = (uint16_t*) 0xB8000;
+static uint16_t* const VGA_MEMORY = (uint16_t*)KERNEL_PHYS_TO_VIRT(0xB8000);
 
 // Scrollback buffer (1000 lines)
 #define SCROLLBACK_LINES 1000
@@ -91,7 +92,7 @@ void terminal_set_mode_80x50(void) {
 	io_wait();
 	
 	// Copy 8x8 font to VGA memory
-	volatile uint8_t* font_mem = (volatile uint8_t*)0xA0000;
+	volatile uint8_t* font_mem = (volatile uint8_t*)KERNEL_PHYS_TO_VIRT(0xA0000);
 	for (int ch = 0; ch < 256; ch++) {
 		for (int line = 0; line < 8; line++) {
 			font_mem[ch * 32 + line] = font_8x8[ch][line];

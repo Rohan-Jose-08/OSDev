@@ -40,6 +40,15 @@ typedef struct {
 	const char *text;
 } gfx_print_t;
 
+typedef struct {
+	int32_t x;
+	int32_t y;
+	int32_t width;
+	int32_t height;
+	int32_t stride;
+	const uint8_t *pixels;
+} gfx_blit_t;
+
 bool graphics_set_mode(uint8_t mode) {
 	return syscall3(SYSCALL_GFX_SET_MODE, mode, 0, 0) == 0;
 }
@@ -84,6 +93,11 @@ void graphics_draw_char(int x, int y, char c, uint8_t fg, uint8_t bg) {
 void graphics_print(int x, int y, const char* str, uint8_t fg, uint8_t bg) {
 	gfx_print_t args = {x, y, fg, bg, str};
 	syscall3(SYSCALL_GFX_PRINT, (uint32_t)&args, 0, 0);
+}
+
+void graphics_blit(int x, int y, int width, int height, const uint8_t* buffer, int stride) {
+	gfx_blit_t args = {x, y, width, height, stride, buffer};
+	syscall3(SYSCALL_GFX_BLIT, (uint32_t)&args, 0, 0);
 }
 
 void graphics_enable_double_buffer(void) {

@@ -19,6 +19,8 @@ void window_putpixel(window_t* win, int x, int y, uint8_t color);
 void window_draw_rect(window_t* win, int x, int y, int width, int height, uint8_t color);
 void window_fill_rect(window_t* win, int x, int y, int width, int height, uint8_t color);
 void window_print(window_t* win, int x, int y, const char* text, uint8_t color);
+void window_blit(window_t* win, int x, int y, int width, int height,
+                 const uint8_t* buffer, int stride);
 
 static inline window_t* window_create(int x, int y, int width, int height, const char* title) {
 	return uwm_window_create(x, y, width, height, title);

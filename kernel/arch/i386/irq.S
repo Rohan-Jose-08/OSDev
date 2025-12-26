@@ -3,48 +3,96 @@
 global irq_stub_%+%1
 irq_stub_%+%1:
     pusha
+    push ds
+    push es
+    push fs
+    push gs
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
     call irq_handler_%+%1
-    popa
-    iret
+    push esp
+    call kpti_prepare_return_trap
+    add esp, 4
+    jmp trampoline_irq_return
 %endmacro
 
 extern keyboard_handler
 extern mouse_handler
 extern timer_handler
 extern PIC_sendEOI
+extern kpti_prepare_return_trap
+extern trampoline_irq_return
 
 ; Timer IRQ (IRQ0)
 global irq_stub_0
 irq_stub_0:
     pusha
+    push ds
+    push es
+    push fs
+    push gs
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    push esp
     call timer_handler
+    add esp, 4
     push 0
     call PIC_sendEOI
     add esp, 4
-    popa
-    iret
+    push esp
+    call kpti_prepare_return_trap
+    add esp, 4
+    jmp trampoline_irq_return
 
 ; Keyboard IRQ (IRQ1)
 global irq_stub_1
 irq_stub_1:
     pusha
+    push ds
+    push es
+    push fs
+    push gs
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
     call keyboard_handler
     push 1
     call PIC_sendEOI
     add esp, 4
-    popa
-    iret
+    push esp
+    call kpti_prepare_return_trap
+    add esp, 4
+    jmp trampoline_irq_return
 
 ; Mouse IRQ (IRQ12)
 global irq_stub_12
 irq_stub_12:
     pusha
+    push ds
+    push es
+    push fs
+    push gs
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
     call mouse_handler
     push 12
     call PIC_sendEOI
     add esp, 4
-    popa
-    iret
+    push esp
+    call kpti_prepare_return_trap
+    add esp, 4
+    jmp trampoline_irq_return
 
 ; Create additional IRQ stubs for future use
 irq_stub 2

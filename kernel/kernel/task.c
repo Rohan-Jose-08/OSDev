@@ -1,5 +1,7 @@
 #include <kernel/task.h>
 #include <kernel/tty.h>
+#include <kernel/memory.h>
+#include <kernel/pagings.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -16,31 +18,112 @@ static uint32_t system_ticks = 0;
 // Time quantum for round-robin scheduling (in timer ticks)
 #define TIME_QUANTUM 5
 
-// Simple memory allocator for kernel stacks
-#define KERNEL_STACK_SIZE 8192
-static uint8_t stack_pool[MAX_TASKS * KERNEL_STACK_SIZE] __attribute__((aligned(16)));
-static bool stack_allocated[MAX_TASKS];
+// Guard-paged kernel stacks for tasks (guard + stack pages).
+#define TASK_STACK_PAGES ((TASK_KERNEL_STACK_SIZE + PAGE_SIZE - 1) / PAGE_SIZE)
+#define TASK_STACK_SLOT_SIZE ((TASK_STACK_PAGES + 1) * PAGE_SIZE)
+#define KERNEL_STACK_BASE (KERNEL_VIRT_BASE + USER_SPACE_START)
+#define PROCESS_STACK_REGION_SIZE (2 * PAGE_SIZE * 128)
+#define TASK_STACK_BASE (KERNEL_STACK_BASE + PROCESS_STACK_REGION_SIZE)
+#define TASK_STACK_SLOTS MAX_TASKS
+
+static uint8_t task_stack_bitmap[(TASK_STACK_SLOTS + 7) / 8];
+
+static inline bool task_stack_slot_used(uint32_t idx) {
+	return (task_stack_bitmap[idx / 8] & (1u << (idx % 8))) != 0;
+}
+
+static inline void task_stack_slot_set(uint32_t idx) {
+	task_stack_bitmap[idx / 8] |= (uint8_t)(1u << (idx % 8));
+}
+
+static inline void task_stack_slot_clear(uint32_t idx) {
+	task_stack_bitmap[idx / 8] &= (uint8_t)~(1u << (idx % 8));
+}
+
+static void enqueue_task(task_t *task);
+
+static bool ticks_reached(uint32_t now, uint32_t target) {
+    return (int32_t)(now - target) >= 0;
+}
+
+static void wake_sleeping_tasks(uint32_t now) {
+    for (int i = 0; i < MAX_TASKS; i++) {
+        task_t *task = &tasks[i];
+        if (task->state != TASK_BLOCKED || !task->sleeping) {
+            continue;
+        }
+        if (!ticks_reached(now, task->sleep_until)) {
+            continue;
+        }
+        task->sleeping = false;
+        task->sleep_until = 0;
+        task->state = TASK_READY;
+        task->time_slice = TIME_QUANTUM;
+        enqueue_task(task);
+    }
+}
 
 // Allocate a kernel stack
 static uint32_t allocate_kernel_stack(void) {
-    for (int i = 0; i < MAX_TASKS; i++) {
-        if (!stack_allocated[i]) {
-            stack_allocated[i] = true;
-            // Stack grows downward, so return the top address
-            return (uint32_t)&stack_pool[(i + 1) * KERNEL_STACK_SIZE];
+    uint32_t *kernel_dir = page_kernel_directory();
+    if (!kernel_dir) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < TASK_STACK_SLOTS; i++) {
+        if (task_stack_slot_used(i)) {
+            continue;
         }
+        uint32_t slot_base = TASK_STACK_BASE + i * TASK_STACK_SLOT_SIZE;
+        uint32_t stack_virt = slot_base + PAGE_SIZE;
+        uint32_t mapped = 0;
+        bool ok = true;
+
+        for (uint32_t page = 0; page < TASK_STACK_PAGES; page++) {
+            uint32_t phys = frame_alloc();
+            if (!phys) {
+                ok = false;
+                break;
+            }
+            if (!page_map(kernel_dir, stack_virt + page * PAGE_SIZE, phys, PAGE_RW)) {
+                frame_free(phys);
+                ok = false;
+                break;
+            }
+            mapped++;
+        }
+
+        if (!ok) {
+            for (uint32_t page = 0; page < mapped; page++) {
+                page_unmap(kernel_dir, stack_virt + page * PAGE_SIZE, true);
+            }
+            return 0;
+        }
+
+        page_unmap(kernel_dir, slot_base, false);
+        task_stack_slot_set(i);
+        return stack_virt + TASK_KERNEL_STACK_SIZE;
     }
     return 0;
 }
 
 // Free a kernel stack
 static void free_kernel_stack(uint32_t stack_top) {
-    for (int i = 0; i < MAX_TASKS; i++) {
-        if ((uint32_t)&stack_pool[(i + 1) * KERNEL_STACK_SIZE] == stack_top) {
-            stack_allocated[i] = false;
-            return;
+    if (stack_top == 0 || stack_top < TASK_STACK_BASE + PAGE_SIZE + TASK_KERNEL_STACK_SIZE) {
+        return;
+    }
+    uint32_t stack_virt = stack_top - TASK_KERNEL_STACK_SIZE;
+    uint32_t slot_base = stack_virt - PAGE_SIZE;
+    uint32_t idx = (slot_base - TASK_STACK_BASE) / TASK_STACK_SLOT_SIZE;
+    if (idx >= TASK_STACK_SLOTS) {
+        return;
+    }
+    uint32_t *kernel_dir = page_kernel_directory();
+    if (kernel_dir) {
+        for (uint32_t page = 0; page < TASK_STACK_PAGES; page++) {
+            page_unmap(kernel_dir, stack_virt + page * PAGE_SIZE, true);
         }
     }
+    task_stack_slot_clear(idx);
 }
 
 // Add task to ready queue
@@ -86,7 +169,9 @@ void scheduler_init(void) {
         tasks[i].id = 0;
         tasks[i].state = TASK_TERMINATED;
         tasks[i].next = NULL;
-        stack_allocated[i] = false;
+        tasks[i].sleep_until = 0;
+        tasks[i].sleeping = false;
+        task_stack_slot_clear((uint32_t)i);
     }
     
     current_task = NULL;
@@ -98,7 +183,6 @@ void scheduler_init(void) {
     // For now, we'll handle this implicitly
     
     scheduler_enabled = true;
-    terminal_writestring("Scheduler: Initialized\n");
 }
 
 // Create a new task
@@ -177,6 +261,8 @@ void task_exit(void) {
     printf("Task %u '%s' terminated\n", current_task->id, current_task->name);
     
     current_task->state = TASK_TERMINATED;
+    current_task->sleeping = false;
+    current_task->sleep_until = 0;
     free_kernel_stack(current_task->kernel_stack);
     
     // Force a context switch
@@ -185,7 +271,18 @@ void task_exit(void) {
 
 // Yield CPU to another task
 void task_yield(void) {
-    if (!scheduler_enabled || !current_task) {
+    if (!scheduler_enabled) {
+        return;
+    }
+
+    if (!current_task) {
+        task_t *next_task = dequeue_task();
+        if (!next_task) {
+            return;
+        }
+        current_task = next_task;
+        current_task->state = TASK_RUNNING;
+        context_switch(NULL, &current_task->regs);
         return;
     }
     
@@ -235,29 +332,45 @@ void task_unblock(task_t *task) {
     }
     
     task->state = TASK_READY;
+    task->sleeping = false;
+    task->sleep_until = 0;
     task->time_slice = TIME_QUANTUM;
     enqueue_task(task);
 }
 
 // Sleep for specified ticks
 void task_sleep(uint32_t ticks) {
-    // Simple implementation - just block and track wake time
-    // In a real OS, you'd maintain a sleep queue with wake times
     if (!current_task) {
         return;
     }
-    
-    // For now, just yield (proper implementation would track sleep time)
-    for (uint32_t i = 0; i < ticks * 1000; i++) {
-        // Busy wait approximation
-        __asm__ volatile ("nop");
+
+    if (ticks == 0) {
+        task_yield();
+        return;
     }
+
+    if (!ready_queue_head) {
+        uint32_t wake = system_ticks + ticks;
+        while (!ticks_reached(system_ticks, wake)) {
+            __asm__ volatile ("hlt");
+        }
+        return;
+    }
+
+    current_task->sleeping = true;
+    current_task->sleep_until = system_ticks + ticks;
+    current_task->state = TASK_BLOCKED;
+    task_yield();
 }
 
 // Scheduler tick (called by timer interrupt)
 void scheduler_tick(void) {
     system_ticks++;
     
+    if (scheduler_enabled) {
+        wake_sleeping_tasks(system_ticks);
+    }
+
     if (!scheduler_enabled || !current_task) {
         return;
     }
@@ -309,6 +422,8 @@ bool task_kill(uint32_t id) {
         task_exit();
     } else {
         task->state = TASK_TERMINATED;
+        task->sleeping = false;
+        task->sleep_until = 0;
         free_kernel_stack(task->kernel_stack);
         printf("Task %u '%s' killed\n", task->id, task->name);
     }

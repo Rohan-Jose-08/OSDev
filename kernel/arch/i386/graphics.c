@@ -1,6 +1,7 @@
 #include <kernel/graphics.h>
 #include <kernel/io.h>
 #include <kernel/tty.h>
+#include <kernel/pagings.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -63,7 +64,7 @@ static void save_vga_font(void) {
     outb(0x3CE, 0x06); outb(0x3CF, 0x00);  // Memory map (A0000-BFFFF)
     
     // Copy font data from VGA memory
-    uint8_t* font_mem = (uint8_t*)0xA0000;
+    uint8_t* font_mem = (uint8_t*)KERNEL_PHYS_TO_VIRT(0xA0000);
     for (int i = 0; i < 256 * 32; i++) {
         saved_font[i] = font_mem[i];
     }
@@ -89,7 +90,7 @@ static void restore_vga_font(void) {
     outb(0x3CE, 0x06); outb(0x3CF, 0x00);  // Memory map A0000-BFFFF
     
     // Copy saved font data back to VGA memory
-    uint8_t* font_mem = (uint8_t*)0xA0000;
+    uint8_t* font_mem = (uint8_t*)KERNEL_PHYS_TO_VIRT(0xA0000);
     for (int i = 0; i < 256 * 32; i++) {
         font_mem[i] = saved_font[i];
     }
@@ -201,7 +202,7 @@ static void set_mode_320x240(void) {
     outb(0x3C0, 0x20);
     
     // Clear screen memory
-    uint8_t* vga = (uint8_t*)0xA0000;
+    uint8_t* vga = (uint8_t*)KERNEL_PHYS_TO_VIRT(0xA0000);
     for (int i = 0; i < 320 * 200; i++) {
         vga[i] = 0;
     }
@@ -387,7 +388,7 @@ bool graphics_set_mode(uint8_t mode) {
             for (volatile int i = 0; i < 100000; i++);
             
             // Clear text buffer at 0xB8000
-            volatile uint16_t* text_mem = (volatile uint16_t*)0xB8000;
+            volatile uint16_t* text_mem = (volatile uint16_t*)KERNEL_PHYS_TO_VIRT(0xB8000);
             for (int i = 0; i < 80 * 25; i++) {
                 text_mem[i] = 0x0720; // White on black space
             }
@@ -631,6 +632,53 @@ void graphics_print(int x, int y, const char* str, uint8_t fg_color, uint8_t bg_
 // Alias for terminal compatibility
 void graphics_draw_char(int x, int y, char c, uint8_t fg_color, uint8_t bg_color) {
     graphics_putchar(x, y, c, fg_color, bg_color);
+}
+
+bool graphics_blit_from_user(uint32_t *page_dir, int x, int y, int width, int height,
+                             int stride, uint32_t user_ptr) {
+    if (current_mode == MODE_TEXT) {
+        return false;
+    }
+    if (!page_dir || width <= 0 || height <= 0 || stride <= 0 || stride < width) {
+        return false;
+    }
+
+    int src_x = 0;
+    int src_y = 0;
+    if (x < 0) {
+        src_x = -x;
+        width += x;
+        x = 0;
+    }
+    if (y < 0) {
+        src_y = -y;
+        height += y;
+        y = 0;
+    }
+    if (x + width > display_width) {
+        width = display_width - x;
+    }
+    if (y + height > display_height) {
+        height = display_height - y;
+    }
+    if (width <= 0 || height <= 0) {
+        return true;
+    }
+    if (src_x >= stride) {
+        return false;
+    }
+
+    uint8_t* target = double_buffer_enabled ? back_buffer : VGA_MEMORY;
+    uint32_t src_base = user_ptr + (uint32_t)src_y * (uint32_t)stride + (uint32_t)src_x;
+
+    for (int row = 0; row < height; row++) {
+        uint8_t* dst = target + (y + row) * display_width + x;
+        if (!page_copy_from_user(page_dir, dst, src_base + (uint32_t)row * (uint32_t)stride,
+                                 (uint32_t)width)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // Scroll screen up by specified number of pixels

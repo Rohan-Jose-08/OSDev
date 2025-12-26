@@ -1,6 +1,7 @@
 #include <kernel/elf.h>
 #include <kernel/fs.h>
 #include <kernel/kmalloc.h>
+#include <kernel/pagings.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -18,7 +19,18 @@ static bool elf_check_header(const elf32_ehdr_t *hdr) {
 	return true;
 }
 
-bool elf_load_file(const char *path, elf_image_t *image) {
+static inline uint32_t align_down(uint32_t value, uint32_t align) {
+	return value & ~(align - 1);
+}
+
+static inline uint32_t align_up(uint32_t value, uint32_t align) {
+	return (value + align - 1) & ~(align - 1);
+}
+
+bool elf_load_file(const char *path, elf_image_t *image, uint32_t *page_dir) {
+	if (!page_dir) {
+		return false;
+	}
 	fs_inode_t inode;
 	if (!fs_stat(path, &inode)) {
 		printf("ELF: file not found: %s\n", path);
@@ -85,9 +97,40 @@ bool elf_load_file(const char *path, elf_image_t *image) {
 			return false;
 		}
 
-		memcpy((void *)ph->vaddr, file + ph->offset, ph->filesz);
+		uint32_t seg_flags = PAGE_USER | PAGE_RW;
+
+		uint32_t seg_start = align_down(ph->vaddr, PAGE_SIZE);
+		uint32_t seg_end = align_up(ph->vaddr + ph->memsz, PAGE_SIZE);
+		for (uint32_t addr = seg_start; addr < seg_end; addr += PAGE_SIZE) {
+			if (!page_map_alloc(page_dir, addr, seg_flags, NULL)) {
+				printf("ELF: failed to map segment page\n");
+				kfree(file);
+				return false;
+			}
+		}
+
+		if (!page_copy_to_user(page_dir, ph->vaddr, file + ph->offset, ph->filesz)) {
+			printf("ELF: failed to copy segment\n");
+			kfree(file);
+			return false;
+		}
 		if (ph->memsz > ph->filesz) {
-			memset((void *)(ph->vaddr + ph->filesz), 0, ph->memsz - ph->filesz);
+			if (!page_memset_user(page_dir, ph->vaddr + ph->filesz, 0,
+			                      ph->memsz - ph->filesz)) {
+				printf("ELF: failed to zero segment tail\n");
+				kfree(file);
+				return false;
+			}
+		}
+
+		if ((ph->flags & PF_W) == 0) {
+			for (uint32_t addr = seg_start; addr < seg_end; addr += PAGE_SIZE) {
+				if (!page_update_flags(page_dir, addr, 0, PAGE_RW)) {
+					printf("ELF: failed to apply W^X\n");
+					kfree(file);
+					return false;
+				}
+			}
 		}
 
 		if (ph->vaddr < min_vaddr) {

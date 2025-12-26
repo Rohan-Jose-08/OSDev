@@ -1,5 +1,6 @@
 #include <kernel/fs.h>
 #include <kernel/ata.h>
+#include <kernel/kmalloc.h>
 #include <kernel/tty.h>
 #include <string.h>
 #include <stdio.h>
@@ -9,16 +10,345 @@ static uint8_t block_buffer[FS_BLOCK_SIZE];
 static uint8_t indirect_buffer[FS_BLOCK_SIZE];  // Separate buffer for indirect blocks
 static fs_inode_t inode_cache[FS_MAX_INODES];
 
+static inline bool bitmap_test(const uint8_t *bitmap, uint32_t index) {
+    return (bitmap[index / 8] & (1u << (index % 8))) != 0;
+}
+
+static inline void bitmap_set(uint8_t *bitmap, uint32_t index) {
+    bitmap[index / 8] |= (uint8_t)(1u << (index % 8));
+}
+
+static inline void bitmap_clear(uint8_t *bitmap, uint32_t index) {
+    bitmap[index / 8] &= (uint8_t)~(1u << (index % 8));
+}
+
+static bool block_num_to_index(uint32_t block_num, uint32_t *index_out) {
+    if (block_num < fs_ctx.superblock.first_data_block) {
+        return false;
+    }
+    uint32_t index = block_num - fs_ctx.superblock.first_data_block;
+    if (index >= fs_ctx.superblock.data_blocks) {
+        return false;
+    }
+    if (index_out) {
+        *index_out = index;
+    }
+    return true;
+}
+
 // Initialize filesystem driver
 void fs_init(void) {
     memset(&fs_ctx, 0, sizeof(fs_context_t));
     fs_ctx.mounted = false;
+    fs_ctx.next_free_inode = 1;
+    fs_ctx.superblock_dirty = false;
+    fs_ctx.defer_superblock_flush = false;
     printf("FS: Filesystem driver initialized\n");
 }
 
 // Get filesystem context
 fs_context_t* fs_get_context(void) {
     return &fs_ctx;
+}
+
+static bool read_block(uint32_t block_num, uint8_t *buffer);
+static bool write_block(uint32_t block_num, const uint8_t *buffer);
+static bool flush_block_bitmap_block(uint32_t bitmap_block_index);
+
+static bool init_block_bitmap(void) {
+    if (fs_ctx.block_bitmap) {
+        kfree(fs_ctx.block_bitmap);
+        fs_ctx.block_bitmap = NULL;
+    }
+    if (fs_ctx.bitmap_dirty) {
+        kfree(fs_ctx.bitmap_dirty);
+        fs_ctx.bitmap_dirty = NULL;
+    }
+
+    fs_ctx.bitmap_bits = fs_ctx.superblock.data_blocks;
+    fs_ctx.bitmap_bytes = (fs_ctx.bitmap_bits + 7) / 8;
+    if (fs_ctx.bitmap_bytes == 0) {
+        fs_ctx.bitmap_bits = 0;
+        fs_ctx.bitmap_dirty_bytes = 0;
+        fs_ctx.next_free_block = 0;
+        return false;
+    }
+
+    fs_ctx.block_bitmap = kcalloc(fs_ctx.bitmap_bytes, 1);
+    if (!fs_ctx.block_bitmap) {
+        fs_ctx.bitmap_bits = 0;
+        fs_ctx.bitmap_bytes = 0;
+        fs_ctx.bitmap_dirty_bytes = 0;
+        fs_ctx.next_free_block = 0;
+        return false;
+    }
+
+    fs_ctx.bitmap_dirty_bytes = fs_ctx.superblock.bitmap_blocks;
+    if (fs_ctx.bitmap_dirty_bytes > 0) {
+        fs_ctx.bitmap_dirty = kcalloc(fs_ctx.bitmap_dirty_bytes, 1);
+    }
+
+    fs_ctx.next_free_block = 0;
+    return true;
+}
+
+static void mark_bitmap_dirty(uint32_t bitmap_block_index) {
+    if (!fs_ctx.bitmap_dirty) {
+        return;
+    }
+    if (bitmap_block_index >= fs_ctx.bitmap_dirty_bytes) {
+        return;
+    }
+    fs_ctx.bitmap_dirty[bitmap_block_index] = 1;
+}
+
+static void flush_bitmap_dirty(void) {
+    if (!fs_ctx.bitmap_dirty || fs_ctx.superblock.bitmap_blocks == 0) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < fs_ctx.superblock.bitmap_blocks; i++) {
+        if (fs_ctx.bitmap_dirty[i]) {
+            flush_block_bitmap_block(i);
+            fs_ctx.bitmap_dirty[i] = 0;
+        }
+    }
+}
+
+static void update_next_free_block(void) {
+    fs_ctx.next_free_block = 0;
+    for (uint32_t i = 0; i < fs_ctx.superblock.data_blocks; i++) {
+        if (!bitmap_test(fs_ctx.block_bitmap, i)) {
+            fs_ctx.next_free_block = i;
+            return;
+        }
+    }
+}
+
+static uint32_t count_used_blocks(void) {
+    if (!fs_ctx.block_bitmap || fs_ctx.bitmap_bits == 0) {
+        return 0;
+    }
+
+    uint32_t used = 0;
+    uint32_t full_bytes = fs_ctx.bitmap_bits / 8;
+    uint32_t remaining_bits = fs_ctx.bitmap_bits % 8;
+
+    for (uint32_t i = 0; i < full_bytes; i++) {
+        uint8_t value = fs_ctx.block_bitmap[i];
+        for (uint8_t bit = 0; bit < 8; bit++) {
+            if (value & (1u << bit)) {
+                used++;
+            }
+        }
+    }
+
+    if (remaining_bits != 0) {
+        uint8_t value = fs_ctx.block_bitmap[full_bytes];
+        for (uint8_t bit = 0; bit < remaining_bits; bit++) {
+            if (value & (1u << bit)) {
+                used++;
+            }
+        }
+    }
+
+    return used;
+}
+
+static bool load_block_bitmap(void) {
+    if (!fs_ctx.block_bitmap || fs_ctx.superblock.bitmap_blocks == 0) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < fs_ctx.superblock.bitmap_blocks; i++) {
+        if (!read_block(fs_ctx.superblock.bitmap_start + i, block_buffer)) {
+            return false;
+        }
+
+        uint32_t offset = i * FS_BLOCK_SIZE;
+        if (offset >= fs_ctx.bitmap_bytes) {
+            break;
+        }
+        uint32_t to_copy = fs_ctx.bitmap_bytes - offset;
+        if (to_copy > FS_BLOCK_SIZE) {
+            to_copy = FS_BLOCK_SIZE;
+        }
+        memcpy(&fs_ctx.block_bitmap[offset], block_buffer, to_copy);
+    }
+
+    return true;
+}
+
+static bool flush_block_bitmap_block(uint32_t bitmap_block_index) {
+    if (!fs_ctx.block_bitmap || fs_ctx.superblock.bitmap_blocks == 0) {
+        return false;
+    }
+    if (bitmap_block_index >= fs_ctx.superblock.bitmap_blocks) {
+        return false;
+    }
+
+    memset(block_buffer, 0, FS_BLOCK_SIZE);
+    uint32_t offset = bitmap_block_index * FS_BLOCK_SIZE;
+    if (offset < fs_ctx.bitmap_bytes) {
+        uint32_t to_copy = fs_ctx.bitmap_bytes - offset;
+        if (to_copy > FS_BLOCK_SIZE) {
+            to_copy = FS_BLOCK_SIZE;
+        }
+        memcpy(block_buffer, &fs_ctx.block_bitmap[offset], to_copy);
+    }
+
+    return write_block(fs_ctx.superblock.bitmap_start + bitmap_block_index, block_buffer);
+}
+
+static void flush_block_bitmap_all(void) {
+    if (!fs_ctx.block_bitmap || fs_ctx.superblock.bitmap_blocks == 0) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < fs_ctx.superblock.bitmap_blocks; i++) {
+        flush_block_bitmap_block(i);
+    }
+}
+
+static void sync_bitmap_index(uint32_t data_block_index, bool set_bit) {
+    if (fs_ctx.superblock.bitmap_blocks == 0) {
+        return;
+    }
+
+    uint32_t byte_index = data_block_index / 8;
+    uint32_t bitmap_block_index = byte_index / FS_BLOCK_SIZE;
+    if (bitmap_block_index >= fs_ctx.superblock.bitmap_blocks) {
+        return;
+    }
+
+    if (fs_ctx.block_bitmap) {
+        if (fs_ctx.defer_bitmap_flush && fs_ctx.bitmap_dirty) {
+            mark_bitmap_dirty(bitmap_block_index);
+            return;
+        }
+        flush_block_bitmap_block(bitmap_block_index);
+        return;
+    }
+
+    uint32_t byte_in_block = byte_index % FS_BLOCK_SIZE;
+    uint8_t mask = (uint8_t)(1u << (data_block_index % 8));
+    uint32_t bitmap_block_num = fs_ctx.superblock.bitmap_start + bitmap_block_index;
+    if (!read_block(bitmap_block_num, block_buffer)) {
+        return;
+    }
+
+    if (set_bit) {
+        block_buffer[byte_in_block] |= mask;
+    } else {
+        block_buffer[byte_in_block] &= (uint8_t)~mask;
+    }
+
+    write_block(bitmap_block_num, block_buffer);
+}
+
+static void flush_superblock(void) {
+    if (!fs_ctx.superblock_dirty) {
+        return;
+    }
+
+    memset(block_buffer, 0, FS_BLOCK_SIZE);
+    memcpy(block_buffer, &fs_ctx.superblock, sizeof(fs_superblock_t));
+    write_block(0, block_buffer);
+    fs_ctx.superblock_dirty = false;
+}
+
+static void mark_superblock_dirty(void) {
+    fs_ctx.superblock_dirty = true;
+    if (!fs_ctx.defer_superblock_flush) {
+        flush_superblock();
+    }
+}
+
+static void update_next_free_inode(void) {
+    fs_ctx.next_free_inode = 0;
+    for (uint16_t i = 1; i < FS_MAX_INODES; i++) {
+        if (inode_cache[i].type == 0) {
+            fs_ctx.next_free_inode = i;
+            return;
+        }
+    }
+}
+
+static void mark_block_used(uint32_t block_num, uint32_t *used_blocks) {
+    uint32_t index = 0;
+    if (!block_num_to_index(block_num, &index)) {
+        return;
+    }
+    if (!bitmap_test(fs_ctx.block_bitmap, index)) {
+        bitmap_set(fs_ctx.block_bitmap, index);
+        if (used_blocks) {
+            (*used_blocks)++;
+        }
+    }
+}
+
+static void rebuild_block_bitmap(void) {
+    if (!fs_ctx.block_bitmap) {
+        return;
+    }
+
+    memset(fs_ctx.block_bitmap, 0, fs_ctx.bitmap_bytes);
+    uint32_t used_blocks = 0;
+
+    for (int i = 0; i < FS_MAX_INODES; i++) {
+        if (inode_cache[i].type == 0) {
+            continue;
+        }
+
+        for (int j = 0; j < FS_DIRECT_BLOCKS; j++) {
+            if (inode_cache[i].blocks[j] != 0) {
+                mark_block_used(inode_cache[i].blocks[j], &used_blocks);
+            }
+        }
+
+        uint32_t indirect_block = inode_cache[i].blocks[FS_INDIRECT_BLOCK];
+        if (indirect_block != 0) {
+            mark_block_used(indirect_block, &used_blocks);
+            if (read_block(indirect_block, indirect_buffer)) {
+                uint32_t *indirect_blocks = (uint32_t*)indirect_buffer;
+                for (int j = 0; j < FS_PTRS_PER_BLOCK; j++) {
+                    if (indirect_blocks[j] != 0) {
+                        mark_block_used(indirect_blocks[j], &used_blocks);
+                    }
+                }
+            }
+        }
+    }
+
+    if (used_blocks > fs_ctx.superblock.data_blocks) {
+        used_blocks = fs_ctx.superblock.data_blocks;
+    }
+    fs_ctx.superblock.free_blocks = fs_ctx.superblock.data_blocks - used_blocks;
+    update_next_free_block();
+}
+
+static void free_block(uint32_t block_num) {
+    uint32_t index = 0;
+    if (!block_num_to_index(block_num, &index)) {
+        return;
+    }
+
+    if (fs_ctx.block_bitmap) {
+        if (bitmap_test(fs_ctx.block_bitmap, index)) {
+            bitmap_clear(fs_ctx.block_bitmap, index);
+            fs_ctx.superblock.free_blocks++;
+            if (index < fs_ctx.next_free_block) {
+                fs_ctx.next_free_block = index;
+            }
+            sync_bitmap_index(index, false);
+            mark_superblock_dirty();
+        }
+        return;
+    }
+
+    fs_ctx.superblock.free_blocks++;
+    sync_bitmap_index(index, false);
+    mark_superblock_dirty();
 }
 
 // Read a block from disk
@@ -81,8 +411,24 @@ bool fs_format(uint8_t drive) {
     
     // Calculate filesystem layout
     uint32_t inode_blocks = (FS_MAX_INODES * sizeof(fs_inode_t) + FS_BLOCK_SIZE - 1) / FS_BLOCK_SIZE;
-    uint32_t first_data_block = 1 + inode_blocks;
-    uint32_t data_blocks = device->size_sectors - first_data_block;
+    uint32_t bitmap_blocks = 0;
+    uint32_t first_data_block = 0;
+    uint32_t data_blocks = 0;
+
+    for (;;) {
+        first_data_block = 1 + inode_blocks + bitmap_blocks;
+        if (device->size_sectors <= first_data_block) {
+            data_blocks = 0;
+            break;
+        }
+        data_blocks = device->size_sectors - first_data_block;
+        uint32_t bits_per_block = FS_BLOCK_SIZE * 8;
+        uint32_t needed_bitmap_blocks = (data_blocks + bits_per_block - 1) / bits_per_block;
+        if (needed_bitmap_blocks == bitmap_blocks) {
+            break;
+        }
+        bitmap_blocks = needed_bitmap_blocks;
+    }
     
     // Create superblock
     fs_superblock_t sb;
@@ -96,6 +442,8 @@ bool fs_format(uint8_t drive) {
     sb.free_blocks = data_blocks;
     sb.free_inodes = FS_MAX_INODES - 1;  // Reserve inode 0 for root
     sb.first_data_block = first_data_block;
+    sb.bitmap_start = 1 + inode_blocks;
+    sb.bitmap_blocks = bitmap_blocks;
     
     // Write superblock
     memset(block_buffer, 0, FS_BLOCK_SIZE);
@@ -128,6 +476,15 @@ bool fs_format(uint8_t drive) {
             return false;
         }
     }
+
+    // Initialize block bitmap
+    for (uint32_t i = 0; i < bitmap_blocks; i++) {
+        memset(block_buffer, 0, FS_BLOCK_SIZE);
+        if (!ata_write_sectors(drive, sb.bitmap_start + i, 1, block_buffer)) {
+            printf("FS: Failed to write block bitmap\n");
+            return false;
+        }
+    }
     
     printf("FS: Format complete (%u inodes, %u data blocks)\n", FS_MAX_INODES, data_blocks);
     return true;
@@ -140,6 +497,8 @@ bool fs_mount(uint8_t drive) {
         printf("FS: Invalid drive %u\n", drive);
         return false;
     }
+
+    fs_ctx.drive = drive;
     
     // Read superblock
     if (!ata_read_sectors(drive, 0, 1, block_buffer)) {
@@ -154,14 +513,46 @@ bool fs_mount(uint8_t drive) {
         printf("FS: Invalid filesystem magic (0x%x)\n", fs_ctx.superblock.magic);
         return false;
     }
+
+    if (fs_ctx.superblock.version != FS_VERSION) {
+        printf("FS: Unsupported filesystem version %u\n", fs_ctx.superblock.version);
+        return false;
+    }
     
     // Load inode table
     if (!load_inode_table()) {
         printf("FS: Failed to load inode table\n");
         return false;
     }
-    
-    fs_ctx.drive = drive;
+
+    if (init_block_bitmap()) {
+        bool superblock_dirty = false;
+        if (!load_block_bitmap()) {
+            printf("FS: Failed to load block bitmap, rebuilding\n");
+            rebuild_block_bitmap();
+            flush_block_bitmap_all();
+            superblock_dirty = true;
+        } else {
+            uint32_t used_blocks = count_used_blocks();
+            if (used_blocks <= fs_ctx.superblock.data_blocks) {
+                uint32_t new_free = fs_ctx.superblock.data_blocks - used_blocks;
+                if (new_free != fs_ctx.superblock.free_blocks) {
+                    fs_ctx.superblock.free_blocks = new_free;
+                    superblock_dirty = true;
+                }
+            }
+            update_next_free_block();
+        }
+        if (superblock_dirty) {
+            fs_ctx.superblock_dirty = true;
+            flush_superblock();
+        }
+    } else {
+        printf("FS: Block bitmap unavailable, using slow allocator\n");
+    }
+
+    update_next_free_inode();
+
     fs_ctx.mounted = true;
     
     printf("FS: Mounted drive %u (%u free blocks, %u free inodes)\n",
@@ -178,56 +569,85 @@ void fs_unmount(void) {
     
     // Save inode table
     save_inode_table();
-    
-    // Write superblock
-    memset(block_buffer, 0, FS_BLOCK_SIZE);
-    memcpy(block_buffer, &fs_ctx.superblock, sizeof(fs_superblock_t));
-    write_block(0, block_buffer);
-    
+
+    // Flush block bitmap before writing superblock
+    flush_bitmap_dirty();
+    flush_block_bitmap_all();
+
+    fs_ctx.defer_superblock_flush = false;
+    flush_superblock();
+
+    if (fs_ctx.block_bitmap) {
+        kfree(fs_ctx.block_bitmap);
+        fs_ctx.block_bitmap = NULL;
+    }
+    if (fs_ctx.bitmap_dirty) {
+        kfree(fs_ctx.bitmap_dirty);
+        fs_ctx.bitmap_dirty = NULL;
+    }
+    fs_ctx.bitmap_bytes = 0;
+    fs_ctx.bitmap_bits = 0;
+    fs_ctx.bitmap_dirty_bytes = 0;
+    fs_ctx.next_free_block = 0;
+    fs_ctx.next_free_inode = 1;
+    fs_ctx.defer_bitmap_flush = false;
+    fs_ctx.superblock_dirty = false;
+    fs_ctx.defer_superblock_flush = false;
+
     fs_ctx.mounted = false;
     printf("FS: Unmounted\n");
 }
 
 // Find a free inode
 static int find_free_inode(void) {
-    for (int i = 1; i < FS_MAX_INODES; i++) {  // Skip root (0)
-        if (inode_cache[i].type == 0) {
-            return i;
+    int start = fs_ctx.next_free_inode ? fs_ctx.next_free_inode : 1;
+    int idx = start;
+
+    for (int scanned = 0; scanned < (FS_MAX_INODES - 1); scanned++) {
+        if (inode_cache[idx].type == 0) {
+            int next = idx + 1;
+            if (next >= FS_MAX_INODES) {
+                next = 1;
+            }
+            fs_ctx.next_free_inode = (uint16_t)next;
+            return idx;
+        }
+
+        idx++;
+        if (idx >= FS_MAX_INODES) {
+            idx = 1;
         }
     }
+
+    fs_ctx.next_free_inode = 0;
     return -1;
 }
 
-// Find a free data block
-static int find_free_block(void) {
+// Find a free data block by scanning inodes (slow path)
+static int find_free_block_slow(void) {
     if (fs_ctx.superblock.free_blocks == 0) {
         return -1;
     }
-    
-    // Simple allocation: just use next available
+
     for (uint32_t i = 0; i < fs_ctx.superblock.data_blocks; i++) {
         uint32_t block_num = fs_ctx.superblock.first_data_block + i;
-        
+
         // Check if block is used by any inode (including direct and indirect blocks)
         bool used = false;
         for (int j = 0; j < FS_MAX_INODES; j++) {
             if (inode_cache[j].type != 0) {
-                // Check direct blocks
                 for (int k = 0; k < FS_DIRECT_BLOCKS; k++) {
                     if (inode_cache[j].blocks[k] == block_num) {
                         used = true;
                         break;
                     }
                 }
-                
-                // Check indirect block pointer itself
+
                 if (!used && inode_cache[j].blocks[FS_INDIRECT_BLOCK] == block_num) {
                     used = true;
                 }
-                
-                // Check blocks referenced by indirect block
+
                 if (!used && inode_cache[j].blocks[FS_INDIRECT_BLOCK] != 0) {
-                    // Read the indirect block
                     static uint8_t temp_buffer[FS_BLOCK_SIZE];
                     if (read_block(inode_cache[j].blocks[FS_INDIRECT_BLOCK], temp_buffer)) {
                         uint32_t *indirect_blocks = (uint32_t*)temp_buffer;
@@ -240,14 +660,58 @@ static int find_free_block(void) {
                     }
                 }
             }
-            if (used) break;
+            if (used) {
+                break;
+            }
         }
-        
+
         if (!used) {
             return block_num;
         }
     }
-    
+
+    return -1;
+}
+
+static int allocate_block(void) {
+    if (fs_ctx.superblock.free_blocks == 0) {
+        return -1;
+    }
+
+    if (!fs_ctx.block_bitmap) {
+        int block = find_free_block_slow();
+        if (block < 0) {
+            return -1;
+        }
+        fs_ctx.superblock.free_blocks--;
+        mark_superblock_dirty();
+        uint32_t index = 0;
+        if (block_num_to_index((uint32_t)block, &index)) {
+            sync_bitmap_index(index, true);
+        }
+        return block;
+    }
+
+    uint32_t total = fs_ctx.superblock.data_blocks;
+    uint32_t start = fs_ctx.next_free_block;
+    for (uint32_t i = 0; i < total; i++) {
+        uint32_t index = start + i;
+        if (index >= total) {
+            index -= total;
+        }
+        if (!bitmap_test(fs_ctx.block_bitmap, index)) {
+            bitmap_set(fs_ctx.block_bitmap, index);
+            fs_ctx.superblock.free_blocks--;
+            sync_bitmap_index(index, true);
+            mark_superblock_dirty();
+            fs_ctx.next_free_block = index + 1;
+            if (fs_ctx.next_free_block >= total) {
+                fs_ctx.next_free_block = 0;
+            }
+            return fs_ctx.superblock.first_data_block + index;
+        }
+    }
+
     return -1;
 }
 
@@ -391,6 +855,7 @@ int fs_create_file(const char *path) {
     strncpy(inode_cache[inode_num].name, filename, FS_MAX_FILENAME - 1);
     
     fs_ctx.superblock.free_inodes--;
+    mark_superblock_dirty();
     save_inode_table();
     
     return inode_num;
@@ -446,6 +911,7 @@ int fs_create_dir(const char *path) {
     strncpy(inode_cache[inode_num].name, dirname, FS_MAX_FILENAME - 1);
     
     fs_ctx.superblock.free_inodes--;
+    mark_superblock_dirty();
     save_inode_table();
     
     return inode_num;
@@ -456,10 +922,9 @@ static int get_file_block(fs_inode_t *inode, uint32_t block_index, bool allocate
     // Direct blocks
     if (block_index < FS_DIRECT_BLOCKS) {
         if (inode->blocks[block_index] == 0 && allocate) {
-            int block = find_free_block();
+            int block = allocate_block();
             if (block < 0) return -1;
             inode->blocks[block_index] = block;
-            fs_ctx.superblock.free_blocks--;
         }
         return inode->blocks[block_index];
     }
@@ -473,10 +938,9 @@ static int get_file_block(fs_inode_t *inode, uint32_t block_index, bool allocate
     // Allocate indirect block if needed
     if (inode->blocks[FS_INDIRECT_BLOCK] == 0) {
         if (!allocate) return 0;
-        int block = find_free_block();
+        int block = allocate_block();
         if (block < 0) return -1;
         inode->blocks[FS_INDIRECT_BLOCK] = block;
-        fs_ctx.superblock.free_blocks--;
         // Initialize indirect block to zeros
         memset(indirect_buffer, 0, FS_BLOCK_SIZE);
         if (!write_block(block, indirect_buffer)) return -1;
@@ -489,10 +953,9 @@ static int get_file_block(fs_inode_t *inode, uint32_t block_index, bool allocate
     
     uint32_t *indirect_blocks = (uint32_t*)indirect_buffer;
     if (indirect_blocks[block_index] == 0 && allocate) {
-        int block = find_free_block();
+        int block = allocate_block();
         if (block < 0) return -1;
         indirect_blocks[block_index] = block;
-        fs_ctx.superblock.free_blocks--;
         // Write back indirect block
         if (!write_block(inode->blocks[FS_INDIRECT_BLOCK], indirect_buffer)) {
             return -1;
@@ -509,8 +972,8 @@ static void free_file_blocks(fs_inode_t *inode) {
     // Free direct blocks
     for (int i = 0; i < FS_DIRECT_BLOCKS; i++) {
         if (inode->blocks[i] != 0) {
+            free_block(inode->blocks[i]);
             inode->blocks[i] = 0;
-            fs_ctx.superblock.free_blocks++;
         }
     }
     
@@ -521,16 +984,16 @@ static void free_file_blocks(fs_inode_t *inode) {
             uint32_t *indirect_blocks = (uint32_t*)indirect_buffer;
             for (int i = 0; i < FS_PTRS_PER_BLOCK; i++) {
                 if (indirect_blocks[i] != 0) {
+                    free_block(indirect_blocks[i]);
                     indirect_blocks[i] = 0;  // Clear the entry
-                    fs_ctx.superblock.free_blocks++;
                 }
             }
             // Write back the cleared indirect block to disk
             write_block(inode->blocks[FS_INDIRECT_BLOCK], indirect_buffer);
         }
         // Free the indirect block itself
+        free_block(inode->blocks[FS_INDIRECT_BLOCK]);
         inode->blocks[FS_INDIRECT_BLOCK] = 0;
-        fs_ctx.superblock.free_blocks++;
     }
     
     inode->size = 0;
@@ -557,16 +1020,13 @@ int fs_write_file(const char *path, const uint8_t *buffer, uint32_t size, uint32
         return -1;
     }
     
+    fs_ctx.defer_superblock_flush = true;
+
     // Free existing blocks before writing new content
     free_file_blocks(inode);
     
-    // Save inode table immediately after freeing so find_free_block sees the cleared blocks
+    // Save inode table immediately after freeing so allocation sees the cleared blocks
     save_inode_table();
-    
-    // Save superblock after freeing to persist free_blocks count
-    memset(block_buffer, 0, FS_BLOCK_SIZE);
-    memcpy(block_buffer, &fs_ctx.superblock, sizeof(fs_superblock_t));
-    write_block(0, block_buffer);
     
     // Calculate blocks needed
     uint32_t blocks_needed = (size + FS_BLOCK_SIZE - 1) / FS_BLOCK_SIZE;
@@ -578,6 +1038,8 @@ int fs_write_file(const char *path, const uint8_t *buffer, uint32_t size, uint32
     // Write data block by block (safer than batching for now)
     uint32_t written = 0;
     static uint8_t write_buffer[FS_BLOCK_SIZE];
+
+    fs_ctx.defer_bitmap_flush = true;
     
     for (uint32_t i = 0; i < blocks_needed && written < size; i++) {
         // Get or allocate block
@@ -603,15 +1065,16 @@ int fs_write_file(const char *path, const uint8_t *buffer, uint32_t size, uint32
         written += to_write;
     }
     
+    fs_ctx.defer_bitmap_flush = false;
+    flush_bitmap_dirty();
+
     inode->size = written;
     
     // Save inode table after all writes complete
     save_inode_table();
-    
-    // Update superblock to reflect freed/allocated blocks
-    memset(block_buffer, 0, FS_BLOCK_SIZE);
-    memcpy(block_buffer, &fs_ctx.superblock, sizeof(fs_superblock_t));
-    write_block(0, block_buffer);
+
+    fs_ctx.defer_superblock_flush = false;
+    flush_superblock();
     
     return written;
 }
@@ -731,6 +1194,7 @@ bool fs_delete(const char *path) {
     }
     
     fs_inode_t *inode = &inode_cache[inode_num];
+    fs_ctx.defer_superblock_flush = true;
     
     // Use free_file_blocks to properly free all blocks (including indirect)
     if (inode->type == 1) {
@@ -739,8 +1203,8 @@ bool fs_delete(const char *path) {
         // For directories, just free direct blocks (no indirect support yet)
         for (int i = 0; i < FS_DIRECT_BLOCKS; i++) {
             if (inode->blocks[i] != 0) {
+                free_block(inode->blocks[i]);
                 inode->blocks[i] = 0;
-                fs_ctx.superblock.free_blocks++;
             }
         }
     }
@@ -748,14 +1212,16 @@ bool fs_delete(const char *path) {
     // Clear the inode
     memset(inode, 0, sizeof(fs_inode_t));
     fs_ctx.superblock.free_inodes++;
+    if (inode_num > 0 && (inode_num < fs_ctx.next_free_inode || fs_ctx.next_free_inode == 0)) {
+        fs_ctx.next_free_inode = (uint16_t)inode_num;
+    }
+    mark_superblock_dirty();
     
     // Save changes
     save_inode_table();
     
-    // Update superblock
-    memset(block_buffer, 0, FS_BLOCK_SIZE);
-    memcpy(block_buffer, &fs_ctx.superblock, sizeof(fs_superblock_t));
-    write_block(0, block_buffer);
+    fs_ctx.defer_superblock_flush = false;
+    flush_superblock();
     
     return true;
 }

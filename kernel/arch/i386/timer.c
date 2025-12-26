@@ -1,7 +1,7 @@
 #include <kernel/io.h>
 #include <kernel/interrupt.h>
 #include <kernel/task.h>
-#include <stdio.h>
+#include <kernel/process.h>
 #include <stdint.h>
 
 // PIT (Programmable Interval Timer) ports
@@ -33,11 +33,13 @@
 static volatile uint32_t timer_ticks = 0;
 
 // Timer interrupt handler
-void timer_handler(void) {
+void timer_handler(trap_frame_t *frame) {
     timer_ticks++;
     
     // Call the scheduler tick
     scheduler_tick();
+    process_tick(timer_ticks);
+    process_schedule(frame);
 }
 
 // Initialize the PIT
@@ -52,8 +54,6 @@ void timer_init(uint32_t frequency) {
     outb(PIT_CHANNEL0, divisor & 0xFF);         // Low byte
     outb(PIT_CHANNEL0, (divisor >> 8) & 0xFF);  // High byte
     
-    printf("Timer: Initialized at %u Hz (%u ms per tick)\n", 
-           frequency, 1000 / frequency);
 }
 
 // Get current tick count
@@ -63,7 +63,23 @@ uint32_t timer_get_ticks(void) {
 
 // Sleep for specified milliseconds (busy wait for now)
 void timer_sleep_ms(uint32_t ms) {
+    if (ms == 0) {
+        return;
+    }
+
+    if (task_current()) {
+        uint32_t ticks = (ms * TIMER_FREQUENCY + 999) / 1000;
+        if (ticks == 0) {
+            ticks = 1;
+        }
+        task_sleep(ticks);
+        return;
+    }
+
     uint32_t target = timer_ticks + (ms * TIMER_FREQUENCY) / 1000;
+    if (target == timer_ticks) {
+        target++;
+    }
     while (timer_ticks < target) {
         __asm__ volatile ("hlt");
     }

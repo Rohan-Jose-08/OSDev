@@ -5,6 +5,7 @@
 #include <stdbool.h>
 
 #define MAX_TASKS 64
+#define TASK_KERNEL_STACK_SIZE 8192
 
 // Task states
 typedef enum {
@@ -35,6 +36,8 @@ typedef struct task {
     uint32_t priority;              // Task priority (0 = highest)
     uint32_t time_slice;            // Remaining time slice in ticks
     uint32_t total_time;            // Total CPU time used
+    uint32_t sleep_until;           // Tick when sleep ends (if sleeping)
+    bool sleeping;                  // Sleep flag for blocked tasks
     struct task *next;              // Next task in queue
 } task_t;
 

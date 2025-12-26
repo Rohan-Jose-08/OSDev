@@ -7,6 +7,7 @@
 #include <kernel/timer.h>
 #include <kernel/keyboard.h>
 #include <kernel/io.h>
+#include <kernel/speaker.h>
 #include <kernel/desktop.h>
 #include <kernel/graphics.h>
 #include <kernel/graphics_demo.h>
@@ -14,6 +15,8 @@
 #include <kernel/calculator.h>
 #include <kernel/file_manager.h>
 #include <kernel/mouse.h>
+#include <kernel/process.h>
+#include <kernel/pagings.h>
 #include <string.h>
 
 volatile uint32_t syscall_exit_requested = 0;
@@ -25,16 +28,8 @@ volatile uint32_t usermode_saved_edi = 0;
 volatile uint32_t usermode_saved_ebp = 0;
 volatile uint32_t usermode_abort_requested = 0;
 
-#define MAX_FDS 16
-#define FD_PATH_MAX 128
 #define ALIAS_NAME_MAX 32
 #define ALIAS_CMD_MAX 256
-
-typedef struct {
-	bool used;
-	char path[FD_PATH_MAX];
-	uint32_t offset;
-} fd_entry_t;
 
 typedef struct {
 	uint32_t size;
@@ -85,8 +80,14 @@ typedef struct {
 	const char *text;
 } user_gfx_print_t;
 
-static fd_entry_t fd_table[MAX_FDS];
-static bool fd_table_initialized = false;
+typedef struct {
+	int32_t x;
+	int32_t y;
+	int32_t width;
+	int32_t height;
+	int32_t stride;
+	const uint8_t *pixels;
+} user_gfx_blit_t;
 
 static bool user_range_ok(uint32_t addr, uint32_t size) {
 	if (size == 0) {
@@ -99,36 +100,68 @@ static bool user_range_ok(uint32_t addr, uint32_t size) {
 	if (end < addr || end > USER_STACK_TOP) {
 		return false;
 	}
+	process_t *proc = process_current();
+	if (!proc || !proc->page_directory) {
+		return false;
+	}
+	if (!page_user_range_mapped(proc->page_directory, addr, size)) {
+		return false;
+	}
 	return true;
+}
+
+static bool user_range_ok_mul(uint32_t addr, uint32_t count, uint32_t size) {
+	if (count == 0 || size == 0) {
+		return true;
+	}
+	if (count > UINT32_MAX / size) {
+		return false;
+	}
+	return user_range_ok(addr, count * size);
 }
 
 static bool copy_user_out(void *dst, uint32_t dst_len, const void *src, uint32_t src_len) {
-	if (!dst || !user_range_ok((uint32_t)dst, dst_len)) {
+	if (src_len == 0) {
+		return true;
+	}
+	if (src_len > dst_len) {
 		return false;
 	}
-	memcpy(dst, src, src_len);
-	return true;
+	if (!dst || !src || !user_range_ok((uint32_t)dst, dst_len)) {
+		return false;
+	}
+	process_t *proc = process_current();
+	if (!proc || !proc->page_directory) {
+		return false;
+	}
+	return page_copy_to_user(proc->page_directory, (uint32_t)dst, src, src_len);
 }
 
 static bool copy_user_in(void *dst, uint32_t dst_len, const void *src, uint32_t src_len) {
-	if (!src || !user_range_ok((uint32_t)src, src_len)) {
+	if (src_len == 0) {
+		return true;
+	}
+	if (src_len > dst_len) {
 		return false;
 	}
-	memcpy(dst, src, src_len);
-	return true;
-}
-
-static void fd_table_reset(void) {
-	for (int i = 0; i < MAX_FDS; i++) {
-		fd_table[i].used = false;
-		fd_table[i].offset = 0;
-		fd_table[i].path[0] = '\0';
+	if (!dst || !src || !user_range_ok((uint32_t)src, src_len)) {
+		return false;
 	}
-	fd_table_initialized = true;
+	process_t *proc = process_current();
+	if (!proc || !proc->page_directory) {
+		return false;
+	}
+	return page_copy_from_user(proc->page_directory, dst, (uint32_t)src, src_len);
 }
 
 static bool copy_user_string(char *dst, size_t dst_size, const char *user_ptr) {
 	if (!dst || dst_size == 0 || !user_ptr) {
+		return false;
+	}
+	dst[0] = '\0';
+
+	process_t *proc = process_current();
+	if (!proc || !proc->page_directory) {
 		return false;
 	}
 
@@ -137,7 +170,10 @@ static bool copy_user_string(char *dst, size_t dst_size, const char *user_ptr) {
 		if (!user_range_ok(addr, 1)) {
 			return false;
 		}
-		char c = *(const char *)addr;
+		char c = '\0';
+		if (!page_copy_from_user(proc->page_directory, &c, addr, 1)) {
+			return false;
+		}
 		dst[i] = c;
 		if (c == '\0') {
 			return true;
@@ -145,7 +181,18 @@ static bool copy_user_string(char *dst, size_t dst_size, const char *user_ptr) {
 	}
 
 	dst[dst_size - 1] = '\0';
-	return true;
+	return false;
+}
+
+static process_t *syscall_require_process(syscall_frame_t *frame) {
+	process_t *proc = process_current();
+	if (!proc) {
+		if (frame) {
+			frame->eax = (uint32_t)-1;
+		}
+		return NULL;
+	}
+	return proc;
 }
 
 void syscall_dispatch(syscall_frame_t *frame) {
@@ -153,23 +200,45 @@ void syscall_dispatch(syscall_frame_t *frame) {
 		case SYSCALL_WRITE: {
 			const char *buf = (const char *)frame->ebx;
 			uint32_t len = frame->ecx;
-			if (!buf || len == 0) {
+			if (len == 0) {
 				frame->eax = 0;
+				break;
+			}
+			if (!buf) {
+				frame->eax = (uint32_t)-1;
 				break;
 			}
 			if (!user_range_ok((uint32_t)buf, len)) {
 				frame->eax = (uint32_t)-1;
 				break;
 			}
-			terminal_write(buf, len);
-			frame->eax = len;
+			uint32_t remaining = len;
+			uint32_t offset = 0;
+			char tmp[256];
+			while (remaining > 0) {
+				uint32_t chunk = remaining;
+				if (chunk > sizeof(tmp)) {
+					chunk = sizeof(tmp);
+				}
+				if (!copy_user_in(tmp, chunk, buf + offset, chunk)) {
+					frame->eax = (uint32_t)-1;
+					break;
+				}
+				terminal_write(tmp, chunk);
+				remaining -= chunk;
+				offset += chunk;
+			}
+			if (frame->eax != (uint32_t)-1) {
+				frame->eax = len;
+			}
 			break;
 		}
 		case SYSCALL_OPEN: {
-			if (!fd_table_initialized) {
-				fd_table_reset();
+			process_t *proc = syscall_require_process(frame);
+			if (!proc) {
+				break;
 			}
-			char path[FD_PATH_MAX];
+			char path[PROCESS_FD_PATH_MAX];
 			if (!copy_user_string(path, sizeof(path), (const char *)frame->ebx)) {
 				frame->eax = (uint32_t)-1;
 				break;
@@ -180,13 +249,13 @@ void syscall_dispatch(syscall_frame_t *frame) {
 				break;
 			}
 			int fd = -1;
-			for (int i = 0; i < MAX_FDS; i++) {
-				if (!fd_table[i].used) {
+			for (int i = 0; i < PROCESS_MAX_FDS; i++) {
+				if (!proc->fds[i].used) {
 					fd = i;
-					fd_table[i].used = true;
-					fd_table[i].offset = 0;
-					strncpy(fd_table[i].path, path, sizeof(fd_table[i].path) - 1);
-					fd_table[i].path[sizeof(fd_table[i].path) - 1] = '\0';
+					proc->fds[i].used = true;
+					proc->fds[i].offset = 0;
+					strncpy(proc->fds[i].path, path, sizeof(proc->fds[i].path) - 1);
+					proc->fds[i].path[sizeof(proc->fds[i].path) - 1] = '\0';
 					break;
 				}
 			}
@@ -194,10 +263,14 @@ void syscall_dispatch(syscall_frame_t *frame) {
 			break;
 		}
 		case SYSCALL_READ: {
+			process_t *proc = syscall_require_process(frame);
+			if (!proc) {
+				break;
+			}
 			uint32_t fd = frame->ebx;
 			uint8_t *buf = (uint8_t *)frame->ecx;
 			uint32_t len = frame->edx;
-			if (fd >= MAX_FDS || !fd_table[fd].used || len == 0) {
+			if (fd >= PROCESS_MAX_FDS || !proc->fds[fd].used || len == 0) {
 				frame->eax = (uint32_t)-1;
 				break;
 			}
@@ -205,29 +278,57 @@ void syscall_dispatch(syscall_frame_t *frame) {
 				frame->eax = (uint32_t)-1;
 				break;
 			}
-			int read = fs_read_file(fd_table[fd].path, buf, len, fd_table[fd].offset);
-			if (read < 0) {
-				frame->eax = (uint32_t)-1;
-				break;
+			uint32_t remaining = len;
+			uint32_t offset = 0;
+			uint8_t tmp[256];
+			while (remaining > 0) {
+				uint32_t chunk = remaining;
+				if (chunk > sizeof(tmp)) {
+					chunk = sizeof(tmp);
+				}
+				int read = fs_read_file(proc->fds[fd].path, tmp, chunk,
+				                        proc->fds[fd].offset);
+				if (read < 0) {
+					frame->eax = (uint32_t)-1;
+					break;
+				}
+				if (read == 0) {
+					break;
+				}
+				if (!copy_user_out(buf + offset, (uint32_t)read, tmp, (uint32_t)read)) {
+					frame->eax = (uint32_t)-1;
+					break;
+				}
+				proc->fds[fd].offset += (uint32_t)read;
+				remaining -= (uint32_t)read;
+				offset += (uint32_t)read;
+				if ((uint32_t)read < chunk) {
+					break;
+				}
 			}
-			fd_table[fd].offset += (uint32_t)read;
-			frame->eax = (uint32_t)read;
+			if (frame->eax != (uint32_t)-1) {
+				frame->eax = offset;
+			}
 			break;
 		}
 		case SYSCALL_CLOSE: {
+			process_t *proc = syscall_require_process(frame);
+			if (!proc) {
+				break;
+			}
 			uint32_t fd = frame->ebx;
-			if (fd >= MAX_FDS || !fd_table[fd].used) {
+			if (fd >= PROCESS_MAX_FDS || !proc->fds[fd].used) {
 				frame->eax = (uint32_t)-1;
 				break;
 			}
-			fd_table[fd].used = false;
-			fd_table[fd].path[0] = '\0';
-			fd_table[fd].offset = 0;
+			proc->fds[fd].used = false;
+			proc->fds[fd].path[0] = '\0';
+			proc->fds[fd].offset = 0;
 			frame->eax = 0;
 			break;
 		}
 		case SYSCALL_STAT: {
-			char path[FD_PATH_MAX];
+			char path[PROCESS_FD_PATH_MAX];
 			user_stat_t *out = (user_stat_t *)frame->ecx;
 
 			if (!copy_user_string(path, sizeof(path), (const char *)frame->ebx)) {
@@ -243,30 +344,39 @@ void syscall_dispatch(syscall_frame_t *frame) {
 				frame->eax = (uint32_t)-1;
 				break;
 			}
-			out->size = inode.size;
-			out->type = inode.type;
+			user_stat_t temp;
+			temp.size = inode.size;
+			temp.type = inode.type;
+			if (!copy_user_out(out, sizeof(temp), &temp, sizeof(temp))) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
 			frame->eax = 0;
 			break;
 		}
 		case SYSCALL_SEEK: {
+			process_t *proc = syscall_require_process(frame);
+			if (!proc) {
+				break;
+			}
 			uint32_t fd = frame->ebx;
 			int32_t offset = (int32_t)frame->ecx;
 			uint32_t whence = frame->edx;
 
-			if (fd >= MAX_FDS || !fd_table[fd].used) {
+			if (fd >= PROCESS_MAX_FDS || !proc->fds[fd].used) {
 				frame->eax = (uint32_t)-1;
 				break;
 			}
 
 			fs_inode_t inode;
-			if (!fs_stat(fd_table[fd].path, &inode)) {
+			if (!fs_stat(proc->fds[fd].path, &inode)) {
 				frame->eax = (uint32_t)-1;
 				break;
 			}
 
 			int32_t base = 0;
 			if (whence == 1) {
-				base = (int32_t)fd_table[fd].offset;
+				base = (int32_t)proc->fds[fd].offset;
 			} else if (whence == 2) {
 				base = (int32_t)inode.size;
 			} else if (whence != 0) {
@@ -280,12 +390,12 @@ void syscall_dispatch(syscall_frame_t *frame) {
 				break;
 			}
 
-			fd_table[fd].offset = (uint32_t)new_off;
+			proc->fds[fd].offset = (uint32_t)new_off;
 			frame->eax = (uint32_t)new_off;
 			break;
 		}
 		case SYSCALL_LISTDIR: {
-			char path[FD_PATH_MAX];
+			char path[PROCESS_FD_PATH_MAX];
 			user_dirent_t *out = (user_dirent_t *)frame->ecx;
 			uint32_t max_entries = frame->edx;
 
@@ -298,7 +408,7 @@ void syscall_dispatch(syscall_frame_t *frame) {
 				break;
 			}
 
-			if (!user_range_ok((uint32_t)out, max_entries * sizeof(user_dirent_t))) {
+			if (!user_range_ok_mul((uint32_t)out, max_entries, sizeof(user_dirent_t))) {
 				frame->eax = (uint32_t)-1;
 				break;
 			}
@@ -321,7 +431,7 @@ void syscall_dispatch(syscall_frame_t *frame) {
 				strncpy(temp.name, entries[i].name, FS_MAX_FILENAME - 1);
 				temp.name[FS_MAX_FILENAME - 1] = '\0';
 
-				char entry_path[FD_PATH_MAX];
+				char entry_path[PROCESS_FD_PATH_MAX];
 				if (strcmp(path, "/") == 0) {
 					snprintf(entry_path, sizeof(entry_path), "/%s", entries[i].name);
 				} else {
@@ -348,7 +458,7 @@ void syscall_dispatch(syscall_frame_t *frame) {
 			break;
 		}
 		case SYSCALL_MKDIR: {
-			char path[FD_PATH_MAX];
+			char path[PROCESS_FD_PATH_MAX];
 			if (!copy_user_string(path, sizeof(path), (const char *)frame->ebx)) {
 				frame->eax = (uint32_t)-1;
 				break;
@@ -358,7 +468,7 @@ void syscall_dispatch(syscall_frame_t *frame) {
 			break;
 		}
 		case SYSCALL_RM: {
-			char path[FD_PATH_MAX];
+			char path[PROCESS_FD_PATH_MAX];
 			if (!copy_user_string(path, sizeof(path), (const char *)frame->ebx)) {
 				frame->eax = (uint32_t)-1;
 				break;
@@ -367,7 +477,7 @@ void syscall_dispatch(syscall_frame_t *frame) {
 			break;
 		}
 		case SYSCALL_TOUCH: {
-			char path[FD_PATH_MAX];
+			char path[PROCESS_FD_PATH_MAX];
 			if (!copy_user_string(path, sizeof(path), (const char *)frame->ebx)) {
 				frame->eax = (uint32_t)-1;
 				break;
@@ -377,7 +487,7 @@ void syscall_dispatch(syscall_frame_t *frame) {
 			break;
 		}
 		case SYSCALL_RENAME: {
-			char old_path[FD_PATH_MAX];
+			char old_path[PROCESS_FD_PATH_MAX];
 			char new_name[FS_MAX_FILENAME];
 			if (!copy_user_string(old_path, sizeof(old_path), (const char *)frame->ebx) ||
 			    !copy_user_string(new_name, sizeof(new_name), (const char *)frame->ecx)) {
@@ -400,12 +510,15 @@ void syscall_dispatch(syscall_frame_t *frame) {
 				frame->eax = (uint32_t)-1;
 				break;
 			}
-			memcpy(buf, cwd, needed);
+			if (!copy_user_out(buf, needed, cwd, needed)) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
 			frame->eax = needed;
 			break;
 		}
 		case SYSCALL_SETCWD: {
-			char path[FD_PATH_MAX];
+			char path[PROCESS_FD_PATH_MAX];
 			if (!copy_user_string(path, sizeof(path), (const char *)frame->ebx)) {
 				frame->eax = (uint32_t)-1;
 				break;
@@ -437,7 +550,7 @@ void syscall_dispatch(syscall_frame_t *frame) {
 			break;
 		}
 		case SYSCALL_WRITEFILE: {
-			char path[FD_PATH_MAX];
+			char path[PROCESS_FD_PATH_MAX];
 			const uint8_t *buf = (const uint8_t *)frame->ecx;
 			uint32_t len = frame->edx;
 
@@ -456,8 +569,38 @@ void syscall_dispatch(syscall_frame_t *frame) {
 				break;
 			}
 
-			int written = fs_write_file(path, buf, len, 0);
-			frame->eax = (written >= 0) ? (uint32_t)written : (uint32_t)-1;
+			if (len == 0) {
+				frame->eax = 0;
+				break;
+			}
+
+			uint32_t remaining = len;
+			uint32_t offset = 0;
+			uint8_t tmp[256];
+			while (remaining > 0) {
+				uint32_t chunk = remaining;
+				if (chunk > sizeof(tmp)) {
+					chunk = sizeof(tmp);
+				}
+				if (!copy_user_in(tmp, chunk, buf + offset, chunk)) {
+					frame->eax = (uint32_t)-1;
+					break;
+				}
+				int written = fs_write_file(path, tmp, chunk, offset);
+				if (written < 0) {
+					frame->eax = (uint32_t)-1;
+					break;
+				}
+				offset += (uint32_t)written;
+				remaining -= (uint32_t)written;
+				if ((uint32_t)written < chunk) {
+					break;
+				}
+			}
+
+			if (frame->eax != (uint32_t)-1) {
+				frame->eax = offset;
+			}
 			break;
 		}
 		case SYSCALL_HISTORY_COUNT: {
@@ -485,8 +628,14 @@ void syscall_dispatch(syscall_frame_t *frame) {
 			if (len <= entry_len) {
 				entry_len = len - 1;
 			}
-			memcpy(buf, entry, entry_len);
-			buf[entry_len] = '\0';
+			if (!copy_user_out(buf, entry_len, entry, entry_len)) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			if (!copy_user_out(buf + entry_len, 1, "\0", 1)) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
 			frame->eax = entry_len;
 			break;
 		}
@@ -506,8 +655,20 @@ void syscall_dispatch(syscall_frame_t *frame) {
 			break;
 		}
 		case SYSCALL_SLEEP_MS: {
-			timer_sleep_ms(frame->ebx);
-			frame->eax = 0;
+			uint32_t ms = frame->ebx;
+			if (ms == 0) {
+				frame->eax = 0;
+				break;
+			}
+			uint32_t ticks = (ms * 100) / 1000;
+			if (ticks == 0 && ms > 0) {
+				ticks = 1;
+			}
+			uint32_t wake = timer_get_ticks() + ticks;
+			if (process_sleep_until(frame, wake)) {
+				timer_sleep_ms(ms);
+				frame->eax = 0;
+			}
 			break;
 		}
 		case SYSCALL_ALIAS_SET: {
@@ -564,8 +725,11 @@ void syscall_dispatch(syscall_frame_t *frame) {
 				break;
 			}
 
-			memcpy(name, tmp_name, sizeof(tmp_name));
-			memcpy(cmd, tmp_cmd, sizeof(tmp_cmd));
+			if (!copy_user_out(name, sizeof(tmp_name), tmp_name, sizeof(tmp_name)) ||
+			    !copy_user_out(cmd, sizeof(tmp_cmd), tmp_cmd, sizeof(tmp_cmd))) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
 			frame->eax = 0;
 			break;
 		}
@@ -587,12 +751,9 @@ void syscall_dispatch(syscall_frame_t *frame) {
 			break;
 		}
 		case SYSCALL_BEEP: {
-			unsigned char tmp = inb(0x61);
-			outb(0x61, tmp | 0x03);
-			for (volatile int i = 0; i < 1000000; i++) {
-			}
-			outb(0x61, tmp);
-			frame->eax = 0;
+			uint32_t frequency = frame->ebx;
+			uint32_t duration = frame->ecx;
+			frame->eax = (speaker_beep(frequency, duration) == 0) ? 0 : (uint32_t)-1;
 			break;
 		}
 		case SYSCALL_HALT: {
@@ -612,12 +773,21 @@ void syscall_dispatch(syscall_frame_t *frame) {
 		}
 		case SYSCALL_GFX_PAINT: {
 			const char *cwd = usermode_get_cwd();
-			char path[FD_PATH_MAX];
+			char path[PROCESS_FD_PATH_MAX];
 			const char *path_ptr = (const char *)frame->ebx;
 
-			if (path_ptr && copy_user_string(path, sizeof(path), path_ptr) && path[0] != '\0') {
-				graphics_paint_demo_with_dir(path);
-			} else if (cwd && *cwd) {
+			if (path_ptr) {
+				if (!copy_user_string(path, sizeof(path), path_ptr)) {
+					frame->eax = (uint32_t)-1;
+					break;
+				}
+				if (path[0] != '\0') {
+					graphics_paint_demo_with_dir(path);
+					frame->eax = 0;
+					break;
+				}
+			}
+			if (cwd && *cwd) {
 				graphics_paint_demo_with_dir(cwd);
 			} else {
 				graphics_paint_demo_with_dir("/");
@@ -636,14 +806,21 @@ void syscall_dispatch(syscall_frame_t *frame) {
 			break;
 		}
 		case SYSCALL_GUI_PAINT: {
-			char path[FD_PATH_MAX];
+			char path[PROCESS_FD_PATH_MAX];
 			const char *path_ptr = (const char *)frame->ebx;
 
-			if (path_ptr && copy_user_string(path, sizeof(path), path_ptr) && path[0] != '\0') {
-				paint_app_windowed(path);
-			} else {
-				paint_app_windowed(NULL);
+			if (path_ptr) {
+				if (!copy_user_string(path, sizeof(path), path_ptr)) {
+					frame->eax = (uint32_t)-1;
+					break;
+				}
+				if (path[0] != '\0') {
+					paint_app_windowed(path);
+					frame->eax = 0;
+					break;
+				}
 			}
+			paint_app_windowed(NULL);
 			frame->eax = 0;
 			break;
 		}
@@ -745,6 +922,32 @@ void syscall_dispatch(syscall_frame_t *frame) {
 			frame->eax = 0;
 			break;
 		}
+		case SYSCALL_GFX_BLIT: {
+			user_gfx_blit_t args;
+			process_t *proc = process_current();
+			if (!copy_user_in(&args, sizeof(args), (const void *)frame->ebx, sizeof(args))) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			if (!proc || !proc->page_directory || !args.pixels ||
+			    args.width <= 0 || args.height <= 0 || args.stride <= 0 ||
+			    args.stride < args.width) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			if (!user_range_ok_mul((uint32_t)args.pixels, (uint32_t)args.height,
+			                       (uint32_t)args.stride)) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			if (!graphics_blit_from_user(proc->page_directory, args.x, args.y, args.width,
+			                             args.height, args.stride, (uint32_t)args.pixels)) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			frame->eax = 0;
+			break;
+		}
 		case SYSCALL_GFX_FLIP: {
 			graphics_flip_buffer();
 			frame->eax = 0;
@@ -774,10 +977,10 @@ void syscall_dispatch(syscall_frame_t *frame) {
 			break;
 		}
 		case SYSCALL_EXEC: {
-			if (!fd_table_initialized) {
-				fd_table_reset();
+			if (!syscall_require_process(frame)) {
+				break;
 			}
-			char path[FD_PATH_MAX];
+			char path[PROCESS_FD_PATH_MAX];
 			char args[USERMODE_MAX_ARGS];
 			uint32_t args_len = frame->edx;
 
@@ -786,7 +989,11 @@ void syscall_dispatch(syscall_frame_t *frame) {
 				break;
 			}
 
-			if (frame->ecx && args_len > 0) {
+			if (args_len > 0) {
+				if (!frame->ecx) {
+					frame->eax = (uint32_t)-1;
+					break;
+				}
 				if (args_len >= USERMODE_MAX_ARGS) {
 					args_len = USERMODE_MAX_ARGS - 1;
 				}
@@ -794,33 +1001,122 @@ void syscall_dispatch(syscall_frame_t *frame) {
 					frame->eax = (uint32_t)-1;
 					break;
 				}
-				memcpy(args, (const void *)frame->ecx, args_len);
+				if (!copy_user_in(args, args_len, (const void *)frame->ecx, args_len)) {
+					frame->eax = (uint32_t)-1;
+					break;
+				}
 				args[args_len] = '\0';
 			} else {
 				args_len = 0;
 				args[0] = '\0';
 			}
-
-			usermode_request_exec(path, args, args_len);
-			syscall_exit_requested = 1;
+			process_t *proc = process_current();
+			if (!proc || !process_exec(proc, path, args, args_len)) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			process_activate(proc);
+			proc->frame.eax = 0;
+			uint32_t kernel_esp = frame->esp;
+			memcpy(frame, &proc->frame, sizeof(*frame));
+			frame->esp = kernel_esp;
 			frame->eax = 0;
 			break;
 		}
 		case SYSCALL_GETARGS: {
+			process_t *proc = syscall_require_process(frame);
+			if (!proc) {
+				break;
+			}
 			char *buf = (char *)frame->ebx;
 			uint32_t len = frame->ecx;
 			if (len > 0 && (!buf || !user_range_ok((uint32_t)buf, len))) {
 				frame->eax = (uint32_t)-1;
 				break;
 			}
-			uint32_t total = usermode_get_args(buf, len);
+			char tmp[USERMODE_MAX_ARGS];
+			uint32_t total = process_get_args(proc, tmp, sizeof(tmp));
+			uint32_t to_copy = total;
+			if (to_copy > len) {
+				to_copy = len;
+			}
+			if (to_copy > 0) {
+				if (!copy_user_out(buf, to_copy, tmp, to_copy)) {
+					frame->eax = (uint32_t)-1;
+					break;
+				}
+			}
 			frame->eax = total;
 			break;
 		}
 		case SYSCALL_EXIT:
-			syscall_exit_code = frame->ebx;
-			syscall_exit_requested = 1;
+			if (!process_exit_current(frame, (int)frame->ebx)) {
+				syscall_exit_code = frame->ebx;
+				syscall_exit_requested = 1;
+			}
 			break;
+		case SYSCALL_SPAWN: {
+			char path[PROCESS_FD_PATH_MAX];
+			char args[USERMODE_MAX_ARGS];
+			uint32_t args_len = frame->edx;
+
+			if (!copy_user_string(path, sizeof(path), (const char *)frame->ebx)) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+
+			if (args_len > 0) {
+				if (!frame->ecx) {
+					frame->eax = (uint32_t)-1;
+					break;
+				}
+				if (args_len >= USERMODE_MAX_ARGS) {
+					args_len = USERMODE_MAX_ARGS - 1;
+				}
+				if (!user_range_ok(frame->ecx, args_len)) {
+					frame->eax = (uint32_t)-1;
+					break;
+				}
+				if (!copy_user_in(args, args_len, (const void *)frame->ecx, args_len)) {
+					frame->eax = (uint32_t)-1;
+					break;
+				}
+				args[args_len] = '\0';
+			} else {
+				args_len = 0;
+				args[0] = '\0';
+			}
+
+			int pid = process_spawn(path, args, args_len);
+			frame->eax = (pid >= 0) ? (uint32_t)pid : (uint32_t)-1;
+			break;
+		}
+		case SYSCALL_FORK: {
+			int pid = process_fork(frame);
+			frame->eax = (pid >= 0) ? (uint32_t)pid : (uint32_t)-1;
+			break;
+		}
+		case SYSCALL_WAIT: {
+			int32_t pid = (int32_t)frame->ebx;
+			uint32_t status_ptr = frame->ecx;
+			if (status_ptr != 0 && !user_range_ok(status_ptr, sizeof(int))) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			int out_pid = -1;
+			int out_status = -1;
+			if (process_wait(frame, pid, status_ptr, &out_pid, &out_status)) {
+				if (status_ptr != 0 && out_pid >= 0) {
+					if (!copy_user_out((void *)status_ptr, sizeof(out_status),
+					                   &out_status, sizeof(out_status))) {
+						frame->eax = (uint32_t)-1;
+						break;
+					}
+				}
+				frame->eax = (uint32_t)out_pid;
+			}
+			break;
+		}
 		default:
 			frame->eax = (uint32_t)-1;
 			break;

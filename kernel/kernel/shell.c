@@ -14,7 +14,9 @@
 #include <kernel/ata.h>
 #include <kernel/fs.h>
 #include <kernel/kmalloc.h>
+#include <kernel/pagings.h>
 #include <kernel/usermode.h>
+#include <kernel/user_programs.h>
 
 // Path length constant (previously from vfs.h)
 #define MAX_PATH_LEN 512
@@ -205,6 +207,7 @@ static const char *builtin_commands[] = {
 	"ps",
 	"kill",
 	"spawn",
+	"stacktest",
 	"diskfmt",
 	"diskmount",
 	"diskls",
@@ -233,6 +236,7 @@ static void command_edit(const char* args);
 static void command_ps(void);
 static void command_kill(const char* args);
 static void command_spawn(const char* args);
+static void command_stacktest(void);
 static void command_diskfmt(const char* args);
 static void command_diskmount(const char* args);
 static void command_diskls(const char* args);
@@ -306,6 +310,35 @@ static bool split_command(const char *command, char *name, size_t name_len, cons
 	return true;
 }
 
+static bool ensure_user_program_available(const char *path) {
+	fs_inode_t inode;
+	if (fs_stat(path, &inode) && inode.type == 1) {
+		return true;
+	}
+	return user_program_install_if_embedded(path);
+}
+
+static bool run_user_attempt(const char *path, const char *args) {
+	if (!ensure_user_program_available(path)) {
+		return false;
+	}
+	uint32_t exit_code = usermode_last_exit_code();
+	if (!usermode_run_elf_with_args(path, args)) {
+		if (exit_code != 0) {
+			if (exit_code >= 128) {
+				printf("User program crashed (exception %u)\n", exit_code - 128);
+			}
+			return true;
+		}
+		return false;
+	}
+	exit_code = usermode_last_exit_code();
+	if (exit_code >= 128) {
+		printf("User program crashed (exception %u)\n", exit_code - 128);
+	}
+	return true;
+}
+
 static bool run_user_program(const char *name, const char *args) {
 	if (!name || !*name) {
 		return false;
@@ -328,30 +361,30 @@ static bool run_user_program(const char *name, const char *args) {
 
 	if (has_slash) {
 		resolve_run_path(resolved, sizeof(resolved), name);
-		return usermode_run_elf_with_args(resolved, args);
+		return run_user_attempt(resolved, args);
 	}
 
 	if (has_elf) {
 		snprintf(resolved, sizeof(resolved), "/bin/%s", name);
-		if (usermode_run_elf_with_args(resolved, args)) {
+		if (run_user_attempt(resolved, args)) {
 			return true;
 		}
 		resolve_run_path(resolved, sizeof(resolved), name);
-		return usermode_run_elf_with_args(resolved, args);
+		return run_user_attempt(resolved, args);
 	}
 
 	snprintf(resolved, sizeof(resolved), "/bin/%s.elf", name);
-	if (usermode_run_elf_with_args(resolved, args)) {
+	if (run_user_attempt(resolved, args)) {
 		return true;
 	}
 
 	resolve_run_path(resolved, sizeof(resolved), name);
-	if (usermode_run_elf_with_args(resolved, args)) {
+	if (run_user_attempt(resolved, args)) {
 		return true;
 	}
 
 	snprintf(resolved, sizeof(resolved), "/bin/%s", name);
-	return usermode_run_elf_with_args(resolved, args);
+	return run_user_attempt(resolved, args);
 }
 
 static void resolve_run_path(char *out, size_t out_size, const char *path) {
@@ -620,6 +653,7 @@ static void execute_command(const char* command) {
 		{"ps", command_ps, NULL, false},
 		{"kill", NULL, command_kill, true},
 		{"spawn", NULL, command_spawn, true},
+		{"stacktest", command_stacktest, NULL, false},
 		{"diskfmt", NULL, command_diskfmt, true},
 		{"diskmount", NULL, command_diskmount, true},
 		{"diskls", NULL, command_diskls, true},
@@ -690,6 +724,8 @@ static void command_help(const char* args) {
 	printf("  ps               - List running tasks\n");
 	printf("  kill <pid>       - Terminate task\n");
 	printf("  spawn <demo>     - Spawn demo task (demo1|demo2|demo3)\n");
+	printf("  stacktest        - Trigger kernel stack overflow (guard page)\n");
+	printf("  fault            - Trigger user-mode page fault test\n");
 	printf("  diskfmt <n>      - Format drive (0-3)\n");
 	printf("  diskmount <n>    - Mount drive (0-3)\n");
 	printf("  diskls           - List files on disk\n");
@@ -1099,6 +1135,31 @@ static void command_spawn(const char* args) {
 	if (!task) {
 		printf("Failed to create task\n");
 	}
+}
+
+static void stacktest_task(void) {
+	task_t *task = task_current();
+	if (!task || task->kernel_stack == 0) {
+		printf("Stack test: no task stack\n");
+		return;
+	}
+	uint32_t stack_base = task->kernel_stack - TASK_KERNEL_STACK_SIZE;
+	uint32_t guard_addr = stack_base - PAGE_SIZE;
+	volatile uint32_t *fault = (volatile uint32_t *)guard_addr;
+	*fault = 0xDEADCAFE;
+	for (;;) {
+		__asm__ volatile ("hlt");
+	}
+}
+
+static void command_stacktest(void) {
+	printf("Stack test: triggering kernel stack overflow (guard page)...\n");
+	task_t *task = task_create("stacktest", stacktest_task, 0);
+	if (!task) {
+		printf("Stack test: failed to create task\n");
+		return;
+	}
+	task_yield();
 }
 
 // Run user-mode ELF program

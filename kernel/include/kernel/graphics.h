@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <kernel/memory.h>
 
 // Graphics modes
 #define MODE_TEXT       0
@@ -13,10 +14,10 @@
 // Mode 13h constants (backward compatibility)
 #define MODE13H_WIDTH   320
 #define MODE13H_HEIGHT  240
-#define MODE13H_MEMORY  ((uint8_t*)0xA0000)
+#define MODE13H_MEMORY  ((uint8_t*)KERNEL_PHYS_TO_VIRT(0xA0000))
 
 // VGA memory address
-#define VGA_MEMORY      ((uint8_t*)0xA0000)
+#define VGA_MEMORY      ((uint8_t*)KERNEL_PHYS_TO_VIRT(0xA0000))
 
 // Color palette (Mode 13h uses VGA 256-color palette)
 #define COLOR_BLACK         0
@@ -65,6 +66,8 @@ void graphics_putchar(int x, int y, char c, uint8_t fg_color, uint8_t bg_color);
 void graphics_print(int x, int y, const char* str, uint8_t fg_color, uint8_t bg_color);
 void graphics_draw_char(int x, int y, char c, uint8_t fg_color, uint8_t bg_color);
 void graphics_scroll_up(int pixels);
+bool graphics_blit_from_user(uint32_t *page_dir, int x, int y, int width, int height,
+                             int stride, uint32_t user_ptr);
 
 // Screen dimensions
 int graphics_get_width(void);

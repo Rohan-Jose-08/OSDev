@@ -61,6 +61,10 @@
 #define SYSCALL_MOUSE_GET_STATE 56
 #define SYSCALL_KEYBOARD_HAS_INPUT 57
 #define SYSCALL_RENAME 58
+#define SYSCALL_SPAWN 59
+#define SYSCALL_WAIT 60
+#define SYSCALL_FORK 61
+#define SYSCALL_GFX_BLIT 62
 
 static inline int syscall3(int num, uint32_t a, uint32_t b, uint32_t c) {
 	int ret;
