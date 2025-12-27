@@ -18,6 +18,21 @@ static uint32_t next_pid = 1;
 static char default_cwd[USERMODE_MAX_PATH] = "/";
 static bool scheduler_active = false;
 
+// Pipe support (simple blocking pipes for user processes).
+#define PIPE_BUFFER_SIZE 1024
+#define PIPE_WAIT_NONE 0
+#define PIPE_WAIT_READ 1
+#define PIPE_WAIT_WRITE 2
+
+struct pipe {
+	uint8_t buffer[PIPE_BUFFER_SIZE];
+	uint32_t read_pos;
+	uint32_t write_pos;
+	uint32_t count;
+	uint32_t readers;
+	uint32_t writers;
+};
+
 // Kernel stack allocator with guard pages.
 #define KERNEL_STACK_BASE (KERNEL_VIRT_BASE + USER_SPACE_START)
 #define KERNEL_STACK_SLOT_SIZE (2 * PAGE_SIZE)
@@ -26,6 +41,10 @@ static bool scheduler_active = false;
 static uint8_t kernel_stack_bitmap[(KERNEL_STACK_SLOTS + 7) / 8];
 static void *kernel_stack_deferred[8];
 static uint32_t kernel_stack_deferred_count = 0;
+
+static void pipe_wake_readers(pipe_t *pipe);
+static void pipe_wake_writers(pipe_t *pipe);
+static void pipe_wait_clear(process_t *proc);
 
 static inline bool kernel_stack_slot_used(uint32_t idx) {
 	return (kernel_stack_bitmap[idx / 8] & (1u << (idx % 8))) != 0;
@@ -53,6 +72,24 @@ static bool kernel_stack_deferred_has(void *base) {
 		}
 	}
 	return false;
+}
+
+static uint32_t align_up_page(uint32_t value) {
+	return (value + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+}
+
+static void process_init_fds(process_t *proc) {
+	for (int i = 0; i < PROCESS_MAX_FDS; i++) {
+		proc->fds[i].used = false;
+		proc->fds[i].type = PROCESS_FD_NONE;
+		proc->fds[i].path[0] = '\0';
+		proc->fds[i].offset = 0;
+		proc->fds[i].pipe = NULL;
+	}
+	for (int i = 0; i < 3 && i < PROCESS_MAX_FDS; i++) {
+		proc->fds[i].used = true;
+		proc->fds[i].type = PROCESS_FD_TTY;
+	}
 }
 
 static bool kernel_stack_alloc(void **out_base, uint32_t *out_top) {
@@ -142,6 +179,32 @@ static void kernel_stack_flush_deferred(void) {
 static void process_all_add(process_t *proc) {
 	proc->all_next = all_head;
 	all_head = proc;
+}
+
+static void process_ready_remove(process_t *proc) {
+	if (!proc) {
+		return;
+	}
+	for (uint8_t i = 0; i < PROCESS_PRIORITY_LEVELS; i++) {
+		process_t *prev = NULL;
+		process_t *cur = ready_heads[i];
+		while (cur) {
+			if (cur == proc) {
+				if (prev) {
+					prev->next = cur->next;
+				} else {
+					ready_heads[i] = cur->next;
+				}
+				if (ready_tails[i] == cur) {
+					ready_tails[i] = prev;
+				}
+				cur->next = NULL;
+				return;
+			}
+			prev = cur;
+			cur = cur->next;
+		}
+	}
 }
 
 static void process_all_remove(process_t *proc) {
@@ -262,6 +325,46 @@ static bool process_user_ptr_ok(process_t *proc, uint32_t addr, uint32_t size) {
 	return true;
 }
 
+static void process_close_all_fds(process_t *proc) {
+	if (!proc) {
+		return;
+	}
+	for (int i = 0; i < PROCESS_MAX_FDS; i++) {
+		process_fd_close(proc, i);
+	}
+}
+
+static void process_sanitize_fds(process_t *proc) {
+	if (!proc) {
+		return;
+	}
+	for (int i = 0; i < PROCESS_MAX_FDS; i++) {
+		process_fd_t *fd = &proc->fds[i];
+		if (!fd->used) {
+			fd->type = PROCESS_FD_NONE;
+			fd->path[0] = '\0';
+			fd->offset = 0;
+			fd->pipe = NULL;
+			continue;
+		}
+		if (fd->type == PROCESS_FD_NONE) {
+			fd->used = false;
+			fd->path[0] = '\0';
+			fd->offset = 0;
+			fd->pipe = NULL;
+			continue;
+		}
+		if ((fd->type == PROCESS_FD_PIPE_READ || fd->type == PROCESS_FD_PIPE_WRITE) &&
+		    !fd->pipe) {
+			fd->used = false;
+			fd->type = PROCESS_FD_NONE;
+			fd->path[0] = '\0';
+			fd->offset = 0;
+			fd->pipe = NULL;
+		}
+	}
+}
+
 static void process_write_status(process_t *proc, int status) {
 	if (!proc || proc->wait_status_ptr == 0) {
 		return;
@@ -334,18 +437,23 @@ process_t *process_create(const char *name) {
 	proc->page_directory = NULL;
 	proc->entry = 0;
 	proc->user_stack_top = USER_STACK_TOP;
+	proc->heap_base = 0;
+	proc->heap_end = 0;
 	proc->kernel_stack_base = NULL;
 	proc->kernel_stack_top = 0;
+	proc->uid = PROCESS_DEFAULT_UID;
+	proc->gid = PROCESS_DEFAULT_GID;
 	if (!kernel_stack_alloc(&proc->kernel_stack_base, &proc->kernel_stack_top)) {
 		process_destroy(proc);
 		return NULL;
 	}
 
-	for (int i = 0; i < PROCESS_MAX_FDS; i++) {
-		proc->fds[i].used = false;
-		proc->fds[i].offset = 0;
-		proc->fds[i].path[0] = '\0';
-	}
+	process_init_fds(proc);
+	proc->pipe_wait = NULL;
+	proc->pipe_wait_op = PIPE_WAIT_NONE;
+	proc->pipe_wait_buf = 0;
+	proc->pipe_wait_len = 0;
+	proc->pipe_wait_done = 0;
 
 	process_all_add(proc);
 	return proc;
@@ -358,6 +466,8 @@ void process_destroy(process_t *proc) {
 	if (current_process == proc) {
 		current_process = NULL;
 	}
+	pipe_wait_clear(proc);
+	process_close_all_fds(proc);
 	if (proc->page_directory) {
 		page_directory_destroy(proc->page_directory);
 		proc->page_directory = NULL;
@@ -403,6 +513,34 @@ process_t *process_current(void) {
 
 void process_set_current(process_t *proc) {
 	current_process = proc;
+}
+
+uint32_t process_get_count(void) {
+	uint32_t count = 0;
+	for (process_t *proc = all_head; proc; proc = proc->all_next) {
+		count++;
+	}
+	return count;
+}
+
+uint32_t process_list(process_info_t *out, uint32_t max) {
+	if (!out || max == 0) {
+		return 0;
+	}
+	uint32_t count = 0;
+	for (process_t *proc = all_head; proc && count < max; proc = proc->all_next) {
+		process_info_t *info = &out[count];
+		memset(info, 0, sizeof(*info));
+		info->pid = proc->pid;
+		info->state = (uint8_t)proc->state;
+		info->priority = proc->priority;
+		info->time_slice = proc->time_slice;
+		info->total_time = proc->total_time;
+		strncpy(info->name, proc->name, PROCESS_NAME_MAX - 1);
+		info->name[PROCESS_NAME_MAX - 1] = '\0';
+		count++;
+	}
+	return count;
 }
 
 void process_set_default_cwd(const char *path) {
@@ -463,6 +601,86 @@ uint32_t process_get_args(process_t *proc, char *dst, uint32_t max_len) {
 	}
 	memcpy(dst, proc->args, to_copy);
 	return total;
+}
+
+static bool process_block_and_switch(trap_frame_t *frame, process_t *current) {
+	if (!frame || !current) {
+		return true;
+	}
+	current->state = PROCESS_BLOCKED;
+	memcpy(&current->frame, frame, sizeof(*frame));
+
+	while (!process_ready_any()) {
+		cpu_hlt();
+	}
+
+	process_t *next = process_ready_dequeue();
+	if (!next) {
+		current->state = PROCESS_RUNNING;
+		return true;
+	}
+
+	current_process = next;
+	next->state = PROCESS_RUNNING;
+	next->reschedule = false;
+	if (next->time_slice == 0) {
+		next->time_slice = PROCESS_TIME_QUANTUM;
+	}
+	process_activate(next);
+	kernel_stack_flush_deferred();
+	uint32_t kernel_esp = frame->esp;
+	memcpy(frame, &next->frame, sizeof(*frame));
+	frame->esp = kernel_esp;
+	return false;
+}
+
+bool process_brk(process_t *proc, uint32_t new_end, uint32_t *out_end) {
+	if (!proc || !proc->page_directory) {
+		return false;
+	}
+	if (proc->heap_base == 0) {
+		return false;
+	}
+
+	uint32_t limit = USER_STACK_TOP - USER_STACK_SIZE;
+	uint32_t current = proc->heap_end;
+
+	if (new_end == 0) {
+		if (out_end) {
+			*out_end = current;
+		}
+		return true;
+	}
+
+	if (new_end < proc->heap_base || new_end > limit) {
+		return false;
+	}
+
+	if (new_end > current) {
+		uint32_t map_start = align_up_page(current);
+		uint32_t map_end = align_up_page(new_end);
+		for (uint32_t addr = map_start; addr < map_end; addr += PAGE_SIZE) {
+			if (!page_map_alloc(proc->page_directory, addr, PAGE_RW | PAGE_USER, NULL)) {
+				for (uint32_t undo = map_start; undo < addr; undo += PAGE_SIZE) {
+					page_unmap(proc->page_directory, undo, true);
+				}
+				return false;
+			}
+			page_memset_user(proc->page_directory, addr, 0, PAGE_SIZE);
+		}
+	} else if (new_end < current) {
+		uint32_t unmap_start = align_up_page(new_end);
+		uint32_t unmap_end = align_up_page(current);
+		for (uint32_t addr = unmap_start; addr < unmap_end; addr += PAGE_SIZE) {
+			page_unmap(proc->page_directory, addr, true);
+		}
+	}
+
+	proc->heap_end = new_end;
+	if (out_end) {
+		*out_end = new_end;
+	}
+	return true;
 }
 
 static void process_setup_frame(process_t *proc) {
@@ -572,6 +790,15 @@ bool process_exec(process_t *proc, const char *path, const char *args, uint32_t 
 		return false;
 	}
 
+	uint32_t heap_base = align_up_page(image.max_vaddr);
+	if (heap_base < ELF_USER_LOAD_MIN) {
+		heap_base = ELF_USER_LOAD_MIN;
+	}
+	if (heap_base > guard_base) {
+		page_directory_destroy(new_dir);
+		return false;
+	}
+
 	kpti_map_kernel_pages(new_dir, proc);
 
 	if (proc->page_directory) {
@@ -581,11 +808,19 @@ bool process_exec(process_t *proc, const char *path, const char *args, uint32_t 
 	proc->page_directory = new_dir;
 	proc->entry = image.entry;
 	proc->user_stack_top = USER_STACK_TOP;
+	proc->heap_base = heap_base;
+	proc->heap_end = heap_base;
+	proc->pipe_wait = NULL;
+	proc->pipe_wait_op = PIPE_WAIT_NONE;
+	proc->pipe_wait_buf = 0;
+	proc->pipe_wait_len = 0;
+	proc->pipe_wait_done = 0;
 	proc->waiting = false;
 	proc->wait_pid = 0;
 	proc->wait_status_ptr = 0;
 	proc->sleeping = false;
 	proc->sleep_until = 0;
+	process_sanitize_fds(proc);
 	process_set_args(proc, args, args_len);
 	process_setup_frame(proc);
 	return true;
@@ -620,8 +855,28 @@ int process_fork(trap_frame_t *frame) {
 	child->cwd[sizeof(child->cwd) - 1] = '\0';
 	process_set_args(child, parent->args, parent->args_len);
 	memcpy(child->fds, parent->fds, sizeof(child->fds));
+	process_sanitize_fds(child);
+	for (int i = 0; i < PROCESS_MAX_FDS; i++) {
+		if (!child->fds[i].used) {
+			continue;
+		}
+		if (child->fds[i].type == PROCESS_FD_PIPE_READ) {
+			pipe_retain_read(child->fds[i].pipe);
+		} else if (child->fds[i].type == PROCESS_FD_PIPE_WRITE) {
+			pipe_retain_write(child->fds[i].pipe);
+		}
+	}
 	child->entry = parent->entry;
 	child->user_stack_top = parent->user_stack_top;
+	child->heap_base = parent->heap_base;
+	child->heap_end = parent->heap_end;
+	child->uid = parent->uid;
+	child->gid = parent->gid;
+	child->pipe_wait = NULL;
+	child->pipe_wait_op = PIPE_WAIT_NONE;
+	child->pipe_wait_buf = 0;
+	child->pipe_wait_len = 0;
+	child->pipe_wait_done = 0;
 
 	uint32_t *child_dir = page_directory_create();
 	if (!child_dir) {
@@ -716,6 +971,8 @@ bool process_exit_current(trap_frame_t *frame, int code) {
 	current->exit_code = code;
 	bool had_waiter = false;
 	process_wake_waiters(current, code, &had_waiter);
+	pipe_wait_clear(current);
+	process_close_all_fds(current);
 
 	current->state = PROCESS_ZOMBIE;
 	if (current->page_directory) {
@@ -894,4 +1151,377 @@ void process_scheduler_start(void) {
 
 void process_scheduler_stop(void) {
 	process_set_scheduler_active(false);
+}
+
+process_t *process_spawn_proc(const char *path, const char *args, uint32_t args_len) {
+	process_t *proc = process_create(path);
+	if (!proc) {
+		return NULL;
+	}
+	if (!process_exec(proc, path, args, args_len)) {
+		process_destroy(proc);
+		return NULL;
+	}
+	proc->state = PROCESS_READY;
+	process_ready_enqueue(proc);
+	return proc;
+}
+
+pipe_t *pipe_create(void) {
+	pipe_t *pipe = (pipe_t *)kmalloc(sizeof(pipe_t));
+	if (!pipe) {
+		return NULL;
+	}
+	memset(pipe, 0, sizeof(*pipe));
+	return pipe;
+}
+
+void pipe_retain_read(pipe_t *pipe) {
+	if (pipe) {
+		pipe->readers++;
+	}
+}
+
+void pipe_retain_write(pipe_t *pipe) {
+	if (pipe) {
+		pipe->writers++;
+	}
+}
+
+static void pipe_maybe_free(pipe_t *pipe) {
+	if (!pipe) {
+		return;
+	}
+	if (pipe->readers == 0 && pipe->writers == 0) {
+		kfree(pipe);
+	}
+}
+
+void pipe_release_read(pipe_t *pipe) {
+	if (!pipe) {
+		return;
+	}
+	if (pipe->readers > 0) {
+		pipe->readers--;
+	}
+	pipe_wake_writers(pipe);
+	pipe_maybe_free(pipe);
+}
+
+void pipe_release_write(pipe_t *pipe) {
+	if (!pipe) {
+		return;
+	}
+	if (pipe->writers > 0) {
+		pipe->writers--;
+	}
+	pipe_wake_readers(pipe);
+	pipe_maybe_free(pipe);
+}
+
+void process_fd_close(process_t *proc, int fd) {
+	if (!proc || fd < 0 || fd >= PROCESS_MAX_FDS) {
+		return;
+	}
+	process_fd_t *entry = &proc->fds[fd];
+	if (!entry->used) {
+		return;
+	}
+	if (entry->type == PROCESS_FD_PIPE_READ) {
+		pipe_release_read(entry->pipe);
+	} else if (entry->type == PROCESS_FD_PIPE_WRITE) {
+		pipe_release_write(entry->pipe);
+	}
+	entry->used = false;
+	entry->type = PROCESS_FD_NONE;
+	entry->path[0] = '\0';
+	entry->offset = 0;
+	entry->pipe = NULL;
+}
+
+bool process_fd_set_pipe(process_t *proc, int fd, pipe_t *pipe, bool writable) {
+	if (!proc || fd < 0 || fd >= PROCESS_MAX_FDS || !pipe) {
+		return false;
+	}
+	process_fd_close(proc, fd);
+	proc->fds[fd].used = true;
+	proc->fds[fd].type = writable ? PROCESS_FD_PIPE_WRITE : PROCESS_FD_PIPE_READ;
+	proc->fds[fd].pipe = pipe;
+	proc->fds[fd].path[0] = '\0';
+	proc->fds[fd].offset = 0;
+	if (writable) {
+		pipe_retain_write(pipe);
+	} else {
+		pipe_retain_read(pipe);
+	}
+	return true;
+}
+
+static void pipe_peek(pipe_t *pipe, uint8_t *dst, uint32_t len) {
+	if (!pipe || !dst || len == 0) {
+		return;
+	}
+	uint32_t first = PIPE_BUFFER_SIZE - pipe->read_pos;
+	if (len <= first) {
+		memcpy(dst, &pipe->buffer[pipe->read_pos], len);
+	} else {
+		memcpy(dst, &pipe->buffer[pipe->read_pos], first);
+		memcpy(dst + first, pipe->buffer, len - first);
+	}
+}
+
+static void pipe_discard(pipe_t *pipe, uint32_t len) {
+	if (!pipe || len == 0) {
+		return;
+	}
+	pipe->read_pos = (pipe->read_pos + len) % PIPE_BUFFER_SIZE;
+	pipe->count -= len;
+}
+
+static void pipe_write_buffer(pipe_t *pipe, const uint8_t *src, uint32_t len) {
+	if (!pipe || !src || len == 0) {
+		return;
+	}
+	uint32_t first = PIPE_BUFFER_SIZE - pipe->write_pos;
+	if (len <= first) {
+		memcpy(&pipe->buffer[pipe->write_pos], src, len);
+	} else {
+		memcpy(&pipe->buffer[pipe->write_pos], src, first);
+		memcpy(pipe->buffer, src + first, len - first);
+	}
+	pipe->write_pos = (pipe->write_pos + len) % PIPE_BUFFER_SIZE;
+	pipe->count += len;
+}
+
+static int pipe_read_now(process_t *proc, pipe_t *pipe, uint32_t user_buf, uint32_t len) {
+	if (!proc || !pipe || len == 0) {
+		return 0;
+	}
+	uint32_t to_read = len;
+	if (to_read > pipe->count) {
+		to_read = pipe->count;
+	}
+	if (to_read == 0) {
+		return 0;
+	}
+	uint8_t tmp[PIPE_BUFFER_SIZE];
+	pipe_peek(pipe, tmp, to_read);
+	if (!page_copy_to_user(proc->page_directory, user_buf, tmp, to_read)) {
+		return -1;
+	}
+	pipe_discard(pipe, to_read);
+	return (int)to_read;
+}
+
+static int pipe_write_now(process_t *proc, pipe_t *pipe, uint32_t user_buf,
+                          uint32_t len, uint32_t offset) {
+	if (!proc || !pipe || len == 0) {
+		return 0;
+	}
+	uint32_t remaining = len;
+	uint32_t written = 0;
+	uint8_t tmp[PIPE_BUFFER_SIZE];
+	while (remaining > 0) {
+		uint32_t space = PIPE_BUFFER_SIZE - pipe->count;
+		if (space == 0) {
+			break;
+		}
+		uint32_t chunk = remaining;
+		if (chunk > space) {
+			chunk = space;
+		}
+		if (chunk > sizeof(tmp)) {
+			chunk = sizeof(tmp);
+		}
+		if (!page_copy_from_user(proc->page_directory, tmp, user_buf + offset + written, chunk)) {
+			return -1;
+		}
+		pipe_write_buffer(pipe, tmp, chunk);
+		written += chunk;
+		remaining -= chunk;
+	}
+	return (int)written;
+}
+
+static void pipe_wait_clear(process_t *proc) {
+	proc->pipe_wait = NULL;
+	proc->pipe_wait_op = PIPE_WAIT_NONE;
+	proc->pipe_wait_buf = 0;
+	proc->pipe_wait_len = 0;
+	proc->pipe_wait_done = 0;
+}
+
+static void pipe_complete_read(process_t *proc) {
+	if (!proc || !proc->pipe_wait || proc->pipe_wait_op != PIPE_WAIT_READ) {
+		return;
+	}
+	pipe_t *pipe = proc->pipe_wait;
+	int result = 0;
+	if (pipe->count > 0) {
+		result = pipe_read_now(proc, pipe, proc->pipe_wait_buf, proc->pipe_wait_len);
+	} else if (pipe->writers == 0) {
+		result = 0;
+	} else {
+		return;
+	}
+	if (result > 0) {
+		pipe_wake_writers(pipe);
+	}
+	proc->frame.eax = (result < 0) ? (uint32_t)-1 : (uint32_t)result;
+	pipe_wait_clear(proc);
+	proc->state = PROCESS_READY;
+	process_ready_enqueue(proc);
+}
+
+static void pipe_complete_write(process_t *proc) {
+	if (!proc || !proc->pipe_wait || proc->pipe_wait_op != PIPE_WAIT_WRITE) {
+		return;
+	}
+	pipe_t *pipe = proc->pipe_wait;
+	if (pipe->readers == 0) {
+		proc->frame.eax = (uint32_t)-1;
+		pipe_wait_clear(proc);
+		proc->state = PROCESS_READY;
+		process_ready_enqueue(proc);
+		return;
+	}
+	uint32_t remaining = proc->pipe_wait_len - proc->pipe_wait_done;
+	int wrote = pipe_write_now(proc, pipe, proc->pipe_wait_buf, remaining, proc->pipe_wait_done);
+	if (wrote < 0) {
+		proc->frame.eax = (uint32_t)-1;
+		pipe_wait_clear(proc);
+		proc->state = PROCESS_READY;
+		process_ready_enqueue(proc);
+		return;
+	}
+	if (wrote > 0) {
+		pipe_wake_readers(pipe);
+	}
+	proc->pipe_wait_done += (uint32_t)wrote;
+	if (proc->pipe_wait_done >= proc->pipe_wait_len) {
+		proc->frame.eax = proc->pipe_wait_len;
+		pipe_wait_clear(proc);
+		proc->state = PROCESS_READY;
+		process_ready_enqueue(proc);
+	}
+}
+
+static void pipe_wake_readers(pipe_t *pipe) {
+	if (!pipe) {
+		return;
+	}
+	for (process_t *proc = all_head; proc; proc = proc->all_next) {
+		if (proc->state != PROCESS_BLOCKED || proc->pipe_wait != pipe ||
+		    proc->pipe_wait_op != PIPE_WAIT_READ) {
+			continue;
+		}
+		pipe_complete_read(proc);
+	}
+}
+
+static void pipe_wake_writers(pipe_t *pipe) {
+	if (!pipe) {
+		return;
+	}
+	for (process_t *proc = all_head; proc; proc = proc->all_next) {
+		if (proc->state != PROCESS_BLOCKED || proc->pipe_wait != pipe ||
+		    proc->pipe_wait_op != PIPE_WAIT_WRITE) {
+			continue;
+		}
+		pipe_complete_write(proc);
+	}
+}
+
+bool process_pipe_read(trap_frame_t *frame, process_t *proc, pipe_t *pipe,
+                       uint32_t user_buf, uint32_t len, int *out_read) {
+	if (!frame || !proc || !pipe || !out_read) {
+		return true;
+	}
+	if (len == 0) {
+		*out_read = 0;
+		return true;
+	}
+	if (pipe->count > 0) {
+		int read = pipe_read_now(proc, pipe, user_buf, len);
+		*out_read = read;
+		pipe_wake_writers(pipe);
+		return true;
+	}
+	if (pipe->writers == 0) {
+		*out_read = 0;
+		return true;
+	}
+	proc->pipe_wait = pipe;
+	proc->pipe_wait_op = PIPE_WAIT_READ;
+	proc->pipe_wait_buf = user_buf;
+	proc->pipe_wait_len = len;
+	proc->pipe_wait_done = 0;
+	if (process_block_and_switch(frame, proc)) {
+		pipe_wait_clear(proc);
+		*out_read = -1;
+		return true;
+	}
+	return false;
+}
+
+bool process_pipe_write(trap_frame_t *frame, process_t *proc, pipe_t *pipe,
+                        uint32_t user_buf, uint32_t len, int *out_written) {
+	if (!frame || !proc || !pipe || !out_written) {
+		return true;
+	}
+	if (len == 0) {
+		*out_written = 0;
+		return true;
+	}
+	if (pipe->readers == 0) {
+		*out_written = -1;
+		return true;
+	}
+	int wrote = pipe_write_now(proc, pipe, user_buf, len, 0);
+	if (wrote < 0) {
+		*out_written = -1;
+		return true;
+	}
+	if (wrote > 0) {
+		pipe_wake_readers(pipe);
+	}
+	if ((uint32_t)wrote >= len) {
+		*out_written = wrote;
+		return true;
+	}
+	proc->pipe_wait = pipe;
+	proc->pipe_wait_op = PIPE_WAIT_WRITE;
+	proc->pipe_wait_buf = user_buf;
+	proc->pipe_wait_len = len;
+	proc->pipe_wait_done = (uint32_t)wrote;
+	if (process_block_and_switch(frame, proc)) {
+		pipe_wait_clear(proc);
+		*out_written = -1;
+		return true;
+	}
+	return false;
+}
+
+bool process_kill_other(uint32_t pid, int exit_code) {
+	process_t *target = process_find(pid);
+	if (!target || target == current_process) {
+		return false;
+	}
+	bool had_waiter = false;
+	target->exit_code = exit_code;
+	process_wake_waiters(target, exit_code, &had_waiter);
+	process_close_all_fds(target);
+	target->waiting = false;
+	target->wait_pid = 0;
+	target->wait_status_ptr = 0;
+	target->sleeping = false;
+	target->sleep_until = 0;
+	pipe_wait_clear(target);
+	target->state = PROCESS_ZOMBIE;
+	if (target->page_directory) {
+		page_directory_destroy(target->page_directory);
+		target->page_directory = NULL;
+	}
+	process_ready_remove(target);
+	return true;
 }

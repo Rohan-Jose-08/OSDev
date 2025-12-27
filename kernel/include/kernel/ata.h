@@ -65,6 +65,7 @@ typedef struct {
     uint16_t bmide;             // Bus Master IDE base address
     uint8_t drive;              // 0 = master, 1 = slave
     bool exists;                // Does this device exist?
+    bool dma_supported;         // Device reports DMA capability
     uint32_t size_sectors;      // Size in sectors
     char model[41];             // Model string
 } ata_device_t;
@@ -87,6 +88,10 @@ bool ata_write_sectors(uint8_t drive, uint32_t lba, uint8_t sector_count, const 
 
 // Get device information
 ata_device_t* ata_get_device(uint8_t drive);
+
+// Toggle DMA usage at runtime (before ata_init)
+void ata_set_dma_enabled(bool enabled);
+bool ata_dma_is_enabled(void);
 
 // Wait for drive to be ready
 bool ata_wait_ready(uint16_t base);

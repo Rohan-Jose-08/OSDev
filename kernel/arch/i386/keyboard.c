@@ -16,6 +16,11 @@
 #define KEY_RIGHT_ARROW 0x83
 #define KEY_PAGE_UP 0x84
 #define KEY_PAGE_DOWN 0x85
+#define KEY_ALT_DOWN 0x90
+#define KEY_ALT_UP 0x91
+#define KEY_F4 0x92
+#define KEY_CTRL_DOWN 0x93
+#define KEY_CTRL_UP 0x94
 
 static char key_buffer[KEY_BUFFER_SIZE];
 static int key_buffer_head = 0;
@@ -95,6 +100,25 @@ void keyboard_init(void) {
     caps_lock = false;
 }
 
+static void keyboard_wait_input(void) {
+    for (int i = 0; i < 100000; i++) {
+        if ((inb(KEYBOARD_STATUS_PORT) & 0x02) == 0) {
+            return;
+        }
+    }
+}
+
+void keyboard_set_typematic(uint8_t delay, uint8_t rate) {
+    delay &= 0x03;
+    rate &= 0x1F;
+    keyboard_wait_input();
+    outb(KEYBOARD_DATA_PORT, 0xF3);
+    io_wait();
+    keyboard_wait_input();
+    outb(KEYBOARD_DATA_PORT, (uint8_t)((delay << 5) | rate));
+    io_wait();
+}
+
 void keyboard_handler(void) {
     uint8_t scancode = inb(KEYBOARD_DATA_PORT);
     io_wait();
@@ -106,6 +130,22 @@ void keyboard_handler(void) {
         if (scancode == 0x2A || scancode == 0x36) {
             shift_pressed = false;
         }
+        // Handle ctrl release
+        if (scancode == 0x1D) {
+            int next_head = (key_buffer_head + 1) % KEY_BUFFER_SIZE;
+            if (next_head != key_buffer_tail) {
+                key_buffer[key_buffer_head] = KEY_CTRL_UP;
+                key_buffer_head = next_head;
+            }
+        }
+        // Handle alt release
+        if (scancode == 0x38) {
+            int next_head = (key_buffer_head + 1) % KEY_BUFFER_SIZE;
+            if (next_head != key_buffer_tail) {
+                key_buffer[key_buffer_head] = KEY_ALT_UP;
+                key_buffer_head = next_head;
+            }
+        }
     } else {
         // Key press
         // Handle shift press
@@ -113,10 +153,40 @@ void keyboard_handler(void) {
             shift_pressed = true;
             return;
         }
+
+        // Handle ctrl press
+        if (scancode == 0x1D) {
+            int next_head = (key_buffer_head + 1) % KEY_BUFFER_SIZE;
+            if (next_head != key_buffer_tail) {
+                key_buffer[key_buffer_head] = KEY_CTRL_DOWN;
+                key_buffer_head = next_head;
+            }
+            return;
+        }
+
+        // Handle alt press
+        if (scancode == 0x38) {
+            int next_head = (key_buffer_head + 1) % KEY_BUFFER_SIZE;
+            if (next_head != key_buffer_tail) {
+                key_buffer[key_buffer_head] = KEY_ALT_DOWN;
+                key_buffer_head = next_head;
+            }
+            return;
+        }
         
         // Handle caps lock
         if (scancode == 0x3A) {
             caps_lock = !caps_lock;
+            return;
+        }
+
+        // Handle function keys needed by UWM
+        if (scancode == 0x3E) { // F4
+            int next_head = (key_buffer_head + 1) % KEY_BUFFER_SIZE;
+            if (next_head != key_buffer_tail) {
+                key_buffer[key_buffer_head] = KEY_F4;
+                key_buffer_head = next_head;
+            }
             return;
         }
         

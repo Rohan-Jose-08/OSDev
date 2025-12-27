@@ -8,6 +8,7 @@
 #include <kernel/keyboard.h>
 #include <kernel/io.h>
 #include <kernel/speaker.h>
+#include <kernel/audio.h>
 #include <kernel/desktop.h>
 #include <kernel/graphics.h>
 #include <kernel/graphics_demo.h>
@@ -17,6 +18,8 @@
 #include <kernel/mouse.h>
 #include <kernel/process.h>
 #include <kernel/pagings.h>
+#include <kernel/kmalloc.h>
+#include <kernel/user_programs.h>
 #include <string.h>
 
 volatile uint32_t syscall_exit_requested = 0;
@@ -34,6 +37,13 @@ volatile uint32_t usermode_abort_requested = 0;
 typedef struct {
 	uint32_t size;
 	uint32_t type;
+	uint16_t permissions;
+	uint16_t uid;
+	uint16_t gid;
+	uint16_t reserved;
+	uint32_t atime;
+	uint32_t mtime;
+	uint32_t ctime;
 } user_stat_t;
 
 typedef struct {
@@ -41,6 +51,23 @@ typedef struct {
 	uint32_t type;
 	uint32_t size;
 } user_dirent_t;
+
+typedef struct {
+	uint32_t total_size;
+	uint32_t used_size;
+	uint32_t free_size;
+	uint32_t largest_free_block;
+} user_heap_stats_t;
+
+typedef struct {
+	uint32_t pid;
+	uint8_t state;
+	uint8_t priority;
+	uint16_t reserved;
+	uint32_t time_slice;
+	uint32_t total_time;
+	char name[PROCESS_NAME_MAX];
+} user_process_info_t;
 
 typedef struct {
 	int32_t x;
@@ -198,6 +225,10 @@ static process_t *syscall_require_process(syscall_frame_t *frame) {
 void syscall_dispatch(syscall_frame_t *frame) {
 	switch (frame->eax) {
 		case SYSCALL_WRITE: {
+			process_t *proc = syscall_require_process(frame);
+			if (!proc) {
+				break;
+			}
 			const char *buf = (const char *)frame->ebx;
 			uint32_t len = frame->ecx;
 			if (len == 0) {
@@ -212,25 +243,41 @@ void syscall_dispatch(syscall_frame_t *frame) {
 				frame->eax = (uint32_t)-1;
 				break;
 			}
-			uint32_t remaining = len;
-			uint32_t offset = 0;
-			char tmp[256];
-			while (remaining > 0) {
-				uint32_t chunk = remaining;
-				if (chunk > sizeof(tmp)) {
-					chunk = sizeof(tmp);
+
+			process_fd_t *out = &proc->fds[1];
+			if (!out->used || out->type == PROCESS_FD_TTY || out->type == PROCESS_FD_NONE) {
+				uint32_t remaining = len;
+				uint32_t offset = 0;
+				char tmp[256];
+				while (remaining > 0) {
+					uint32_t chunk = remaining;
+					if (chunk > sizeof(tmp)) {
+						chunk = sizeof(tmp);
+					}
+					if (!copy_user_in(tmp, chunk, buf + offset, chunk)) {
+						frame->eax = (uint32_t)-1;
+						break;
+					}
+					terminal_write(tmp, chunk);
+					remaining -= chunk;
+					offset += chunk;
 				}
-				if (!copy_user_in(tmp, chunk, buf + offset, chunk)) {
-					frame->eax = (uint32_t)-1;
+				if (frame->eax != (uint32_t)-1) {
+					frame->eax = len;
+				}
+				break;
+			}
+
+			if (out->type == PROCESS_FD_PIPE_WRITE) {
+				int written = 0;
+				if (!process_pipe_write(frame, proc, out->pipe, (uint32_t)buf, len, &written)) {
 					break;
 				}
-				terminal_write(tmp, chunk);
-				remaining -= chunk;
-				offset += chunk;
+				frame->eax = (written < 0) ? (uint32_t)-1 : (uint32_t)written;
+				break;
 			}
-			if (frame->eax != (uint32_t)-1) {
-				frame->eax = len;
-			}
+
+			frame->eax = (uint32_t)-1;
 			break;
 		}
 		case SYSCALL_OPEN: {
@@ -253,10 +300,26 @@ void syscall_dispatch(syscall_frame_t *frame) {
 				if (!proc->fds[i].used) {
 					fd = i;
 					proc->fds[i].used = true;
+					proc->fds[i].type = PROCESS_FD_FILE;
 					proc->fds[i].offset = 0;
 					strncpy(proc->fds[i].path, path, sizeof(proc->fds[i].path) - 1);
 					proc->fds[i].path[sizeof(proc->fds[i].path) - 1] = '\0';
+					proc->fds[i].pipe = NULL;
 					break;
+				}
+			}
+			if (fd < 0) {
+				for (int i = 0; i < PROCESS_MAX_FDS; i++) {
+					if (proc->fds[i].used && proc->fds[i].type == PROCESS_FD_NONE) {
+						fd = i;
+						proc->fds[i].used = true;
+						proc->fds[i].type = PROCESS_FD_FILE;
+						proc->fds[i].offset = 0;
+						strncpy(proc->fds[i].path, path, sizeof(proc->fds[i].path) - 1);
+						proc->fds[i].path[sizeof(proc->fds[i].path) - 1] = '\0';
+						proc->fds[i].pipe = NULL;
+						break;
+					}
 				}
 			}
 			frame->eax = (fd >= 0) ? (uint32_t)fd : (uint32_t)-1;
@@ -278,6 +341,48 @@ void syscall_dispatch(syscall_frame_t *frame) {
 				frame->eax = (uint32_t)-1;
 				break;
 			}
+			process_fd_t *entry = &proc->fds[fd];
+			if (entry->type == PROCESS_FD_PIPE_READ) {
+				int read = 0;
+				if (!process_pipe_read(frame, proc, entry->pipe, (uint32_t)buf, len, &read)) {
+					break;
+				}
+				frame->eax = (read < 0) ? (uint32_t)-1 : (uint32_t)read;
+				break;
+			}
+			if (entry->type == PROCESS_FD_TTY) {
+				uint32_t total = 0;
+				uint8_t tmp[64];
+				while (total < len) {
+					while (!keyboard_has_input()) {
+						__asm__ volatile ("hlt");
+					}
+					uint32_t chunk = 0;
+					while (chunk < sizeof(tmp) && total + chunk < len && keyboard_has_input()) {
+						tmp[chunk++] = (uint8_t)keyboard_getchar();
+					}
+					if (chunk == 0) {
+						break;
+					}
+					if (!copy_user_out(buf + total, chunk, tmp, chunk)) {
+						frame->eax = (uint32_t)-1;
+						break;
+					}
+					total += chunk;
+					if (!keyboard_has_input()) {
+						break;
+					}
+				}
+				if (frame->eax != (uint32_t)-1) {
+					frame->eax = total;
+				}
+				break;
+			}
+			if (entry->type != PROCESS_FD_FILE) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+
 			uint32_t remaining = len;
 			uint32_t offset = 0;
 			uint8_t tmp[256];
@@ -286,8 +391,7 @@ void syscall_dispatch(syscall_frame_t *frame) {
 				if (chunk > sizeof(tmp)) {
 					chunk = sizeof(tmp);
 				}
-				int read = fs_read_file(proc->fds[fd].path, tmp, chunk,
-				                        proc->fds[fd].offset);
+				int read = fs_read_file(entry->path, tmp, chunk, entry->offset);
 				if (read < 0) {
 					frame->eax = (uint32_t)-1;
 					break;
@@ -299,7 +403,7 @@ void syscall_dispatch(syscall_frame_t *frame) {
 					frame->eax = (uint32_t)-1;
 					break;
 				}
-				proc->fds[fd].offset += (uint32_t)read;
+				entry->offset += (uint32_t)read;
 				remaining -= (uint32_t)read;
 				offset += (uint32_t)read;
 				if ((uint32_t)read < chunk) {
@@ -321,9 +425,7 @@ void syscall_dispatch(syscall_frame_t *frame) {
 				frame->eax = (uint32_t)-1;
 				break;
 			}
-			proc->fds[fd].used = false;
-			proc->fds[fd].path[0] = '\0';
-			proc->fds[fd].offset = 0;
+			process_fd_close(proc, (int)fd);
 			frame->eax = 0;
 			break;
 		}
@@ -347,6 +449,13 @@ void syscall_dispatch(syscall_frame_t *frame) {
 			user_stat_t temp;
 			temp.size = inode.size;
 			temp.type = inode.type;
+			temp.permissions = inode.permissions;
+			temp.uid = inode.uid;
+			temp.gid = inode.gid;
+			temp.reserved = 0;
+			temp.atime = inode.atime;
+			temp.mtime = inode.mtime;
+			temp.ctime = inode.ctime;
 			if (!copy_user_out(out, sizeof(temp), &temp, sizeof(temp))) {
 				frame->eax = (uint32_t)-1;
 				break;
@@ -363,7 +472,8 @@ void syscall_dispatch(syscall_frame_t *frame) {
 			int32_t offset = (int32_t)frame->ecx;
 			uint32_t whence = frame->edx;
 
-			if (fd >= PROCESS_MAX_FDS || !proc->fds[fd].used) {
+			if (fd >= PROCESS_MAX_FDS || !proc->fds[fd].used ||
+			    proc->fds[fd].type != PROCESS_FD_FILE) {
 				frame->eax = (uint32_t)-1;
 				break;
 			}
@@ -574,33 +684,33 @@ void syscall_dispatch(syscall_frame_t *frame) {
 				break;
 			}
 
+			uint8_t *tmp = (uint8_t *)kmalloc(len);
+			if (!tmp) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+
 			uint32_t remaining = len;
 			uint32_t offset = 0;
-			uint8_t tmp[256];
 			while (remaining > 0) {
 				uint32_t chunk = remaining;
-				if (chunk > sizeof(tmp)) {
-					chunk = sizeof(tmp);
+				if (chunk > 256) {
+					chunk = 256;
 				}
-				if (!copy_user_in(tmp, chunk, buf + offset, chunk)) {
+				if (!copy_user_in(tmp + offset, chunk, buf + offset, chunk)) {
 					frame->eax = (uint32_t)-1;
 					break;
 				}
-				int written = fs_write_file(path, tmp, chunk, offset);
-				if (written < 0) {
-					frame->eax = (uint32_t)-1;
-					break;
-				}
-				offset += (uint32_t)written;
-				remaining -= (uint32_t)written;
-				if ((uint32_t)written < chunk) {
-					break;
-				}
+				offset += chunk;
+				remaining -= chunk;
 			}
 
 			if (frame->eax != (uint32_t)-1) {
-				frame->eax = offset;
+				int written = fs_write_file(path, tmp, len, 0);
+				frame->eax = (written < 0) ? (uint32_t)-1 : (uint32_t)written;
 			}
+
+			kfree(tmp);
 			break;
 		}
 		case SYSCALL_HISTORY_COUNT: {
@@ -754,6 +864,278 @@ void syscall_dispatch(syscall_frame_t *frame) {
 			uint32_t frequency = frame->ebx;
 			uint32_t duration = frame->ecx;
 			frame->eax = (speaker_beep(frequency, duration) == 0) ? 0 : (uint32_t)-1;
+			break;
+		}
+		case SYSCALL_SPEAKER_START: {
+			uint32_t frequency = frame->ebx;
+			speaker_start(frequency);
+			frame->eax = 0;
+			break;
+		}
+		case SYSCALL_SPEAKER_STOP: {
+			speaker_stop();
+			frame->eax = 0;
+			break;
+		}
+		case SYSCALL_AUDIO_WRITE: {
+			process_t *proc = syscall_require_process(frame);
+			if (!proc) {
+				break;
+			}
+			const uint8_t *buf = (const uint8_t *)frame->ebx;
+			uint32_t len = frame->ecx;
+			if (!buf || len == 0) {
+				frame->eax = 0;
+				break;
+			}
+			if (!user_range_ok((uint32_t)buf, len)) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			uint32_t total = 0;
+			uint8_t tmp[256];
+			while (total < len) {
+				uint32_t chunk = len - total;
+				if (chunk > sizeof(tmp)) {
+					chunk = sizeof(tmp);
+				}
+				if (!copy_user_in(tmp, chunk, buf + total, chunk)) {
+					frame->eax = (uint32_t)-1;
+					break;
+				}
+				int written = audio_write(tmp, chunk);
+				if (written < 0) {
+					frame->eax = (uint32_t)-1;
+					break;
+				}
+				if (written == 0) {
+					break;
+				}
+				total += (uint32_t)written;
+				if ((uint32_t)written < chunk) {
+					break;
+				}
+			}
+			if (frame->eax != (uint32_t)-1) {
+				frame->eax = total;
+			}
+			break;
+		}
+		case SYSCALL_AUDIO_SET_VOLUME: {
+			uint8_t master = (uint8_t)frame->ebx;
+			uint8_t pcm = (uint8_t)frame->ecx;
+			frame->eax = audio_set_volume(master, pcm) ? 0 : (uint32_t)-1;
+			break;
+		}
+		case SYSCALL_AUDIO_GET_VOLUME: {
+			uint8_t master = 0;
+			uint8_t pcm = 0;
+			if (!audio_get_volume(&master, &pcm)) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			frame->eax = (uint32_t)master | ((uint32_t)pcm << 8);
+			break;
+		}
+		case SYSCALL_AUDIO_STATUS: {
+			frame->eax = audio_is_ready() ? 1u : 0u;
+			break;
+		}
+		case SYSCALL_FS_FREE_BLOCKS: {
+			frame->eax = fs_get_free_blocks();
+			break;
+		}
+		case SYSCALL_HEAP_STATS: {
+			user_heap_stats_t *out = (user_heap_stats_t *)frame->ebx;
+			uint32_t size = frame->ecx;
+			heap_stats_t stats;
+
+			if (!out || size < sizeof(user_heap_stats_t)) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+
+			kmalloc_get_stats(&stats);
+			user_heap_stats_t temp;
+			temp.total_size = (uint32_t)stats.total_size;
+			temp.used_size = (uint32_t)stats.used_size;
+			temp.free_size = (uint32_t)stats.free_size;
+			temp.largest_free_block = (uint32_t)stats.largest_free_block;
+
+			if (!copy_user_out(out, size, &temp, sizeof(temp))) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			frame->eax = 0;
+			break;
+		}
+		case SYSCALL_PROCESS_COUNT: {
+			frame->eax = process_get_count();
+			break;
+		}
+		case SYSCALL_PROCESS_LIST: {
+			user_process_info_t *out = (user_process_info_t *)frame->ebx;
+			uint32_t max_entries = frame->ecx;
+			if (!out || max_entries == 0) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			if (!user_range_ok_mul((uint32_t)out, max_entries, sizeof(user_process_info_t))) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+
+			uint32_t cap = max_entries;
+			if (cap > 32) {
+				cap = 32;
+			}
+
+			process_info_t list[32];
+			uint32_t count = process_list(list, cap);
+			for (uint32_t i = 0; i < count; i++) {
+				user_process_info_t temp;
+				memset(&temp, 0, sizeof(temp));
+				temp.pid = list[i].pid;
+				temp.state = list[i].state;
+				temp.priority = list[i].priority;
+				temp.time_slice = list[i].time_slice;
+				temp.total_time = list[i].total_time;
+				strncpy(temp.name, list[i].name, PROCESS_NAME_MAX - 1);
+				temp.name[PROCESS_NAME_MAX - 1] = '\0';
+				if (!copy_user_out(&out[i], sizeof(user_process_info_t), &temp, sizeof(temp))) {
+					frame->eax = (uint32_t)-1;
+					break;
+				}
+			}
+
+			if (frame->eax == (uint32_t)-1) {
+				break;
+			}
+			frame->eax = count;
+			break;
+		}
+		case SYSCALL_INSTALL_EMBEDDED: {
+			char path[PROCESS_FD_PATH_MAX];
+			const char *path_ptr = (const char *)frame->ebx;
+			if (!path_ptr || !copy_user_string(path, sizeof(path), path_ptr)) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			frame->eax = user_program_install_if_embedded(path) ? 0 : (uint32_t)-1;
+			break;
+		}
+		case SYSCALL_BRK: {
+			process_t *proc = syscall_require_process(frame);
+			if (!proc) {
+				break;
+			}
+			uint32_t new_end = frame->ebx;
+			uint32_t out_end = 0;
+			if (!process_brk(proc, new_end, &out_end)) {
+				frame->eax = (uint32_t)-1;
+			} else {
+				frame->eax = out_end;
+			}
+			break;
+		}
+		case SYSCALL_PIPE: {
+			process_t *proc = syscall_require_process(frame);
+			if (!proc) {
+				break;
+			}
+			int *fds = (int *)frame->ebx;
+			if (!fds || !user_range_ok((uint32_t)fds, sizeof(int) * 2)) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			int fd_read = -1;
+			int fd_write = -1;
+			for (int i = 0; i < PROCESS_MAX_FDS; i++) {
+				if (!proc->fds[i].used) {
+					fd_read = i;
+					break;
+				}
+			}
+			if (fd_read >= 0) {
+				for (int i = fd_read + 1; i < PROCESS_MAX_FDS; i++) {
+					if (!proc->fds[i].used) {
+						fd_write = i;
+						break;
+					}
+				}
+			}
+			if (fd_read < 0 || fd_write < 0) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			pipe_t *pipe = pipe_create();
+			if (!pipe) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			process_fd_set_pipe(proc, fd_read, pipe, false);
+			process_fd_set_pipe(proc, fd_write, pipe, true);
+			int tmp[2] = {fd_read, fd_write};
+			if (!copy_user_out(fds, sizeof(tmp), tmp, sizeof(tmp))) {
+				process_fd_close(proc, fd_read);
+				process_fd_close(proc, fd_write);
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			frame->eax = 0;
+			break;
+		}
+		case SYSCALL_DUP2: {
+			process_t *proc = syscall_require_process(frame);
+			if (!proc) {
+				break;
+			}
+			int oldfd = (int)frame->ebx;
+			int newfd = (int)frame->ecx;
+			if (oldfd < 0 || oldfd >= PROCESS_MAX_FDS ||
+			    newfd < 0 || newfd >= PROCESS_MAX_FDS) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			if (!proc->fds[oldfd].used) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			if (oldfd == newfd) {
+				frame->eax = (uint32_t)newfd;
+				break;
+			}
+			process_fd_close(proc, newfd);
+			proc->fds[newfd] = proc->fds[oldfd];
+			proc->fds[newfd].used = true;
+			if (proc->fds[newfd].type == PROCESS_FD_PIPE_READ) {
+				pipe_retain_read(proc->fds[newfd].pipe);
+			} else if (proc->fds[newfd].type == PROCESS_FD_PIPE_WRITE) {
+				pipe_retain_write(proc->fds[newfd].pipe);
+			}
+			frame->eax = (uint32_t)newfd;
+			break;
+		}
+		case SYSCALL_KILL: {
+			process_t *proc = syscall_require_process(frame);
+			if (!proc) {
+				break;
+			}
+			uint32_t pid = frame->ebx;
+			int sig = (int)frame->ecx;
+			int exit_code = 128 + sig;
+			if (pid == 0 || sig <= 0) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			if (proc->pid == pid) {
+				if (!process_exit_current(frame, exit_code)) {
+					syscall_exit_code = exit_code;
+					syscall_exit_requested = 1;
+				}
+				break;
+			}
+			frame->eax = process_kill_other(pid, exit_code) ? 0 : (uint32_t)-1;
 			break;
 		}
 		case SYSCALL_HALT: {
@@ -974,6 +1356,17 @@ void syscall_dispatch(syscall_frame_t *frame) {
 		}
 		case SYSCALL_KEYBOARD_HAS_INPUT: {
 			frame->eax = keyboard_has_input() ? 1 : 0;
+			break;
+		}
+		case SYSCALL_KEY_REPEAT: {
+			uint32_t delay = frame->ebx;
+			uint32_t rate = frame->ecx;
+			if (delay > 3 || rate > 31) {
+				frame->eax = (uint32_t)-1;
+				break;
+			}
+			keyboard_set_typematic((uint8_t)delay, (uint8_t)rate);
+			frame->eax = 0;
 			break;
 		}
 		case SYSCALL_EXEC: {

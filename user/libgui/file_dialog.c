@@ -2,6 +2,7 @@
 #include <file_dialog.h>
 #include <gui_window.h>
 #include <graphics.h>
+#include <mouse.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,6 +30,9 @@ typedef struct {
     char current_path[64];
     char input_buffer[64];
     int input_cursor;
+    bool input_selecting;
+    int input_sel_anchor;
+    int input_sel_end;
     
     fd_entry_t files[FD_MAX_FILES];
     int file_count;
@@ -48,6 +52,92 @@ static void fd_draw_ui(file_dialog_t* dialog);
 static void fd_navigate_to(file_dialog_t* dialog, const char* name);
 static void fd_confirm(file_dialog_t* dialog);
 static void fd_cancel(file_dialog_t* dialog);
+
+static void fd_input_clear_selection(file_dialog_t* dialog) {
+    if (!dialog) return;
+    dialog->input_selecting = false;
+    dialog->input_sel_anchor = dialog->input_cursor;
+    dialog->input_sel_end = dialog->input_cursor;
+}
+
+static bool fd_input_has_selection(const file_dialog_t* dialog) {
+    return dialog && dialog->input_sel_anchor != dialog->input_sel_end;
+}
+
+static void fd_input_normalize_selection(const file_dialog_t* dialog, int* start, int* end) {
+    int a = dialog->input_sel_anchor;
+    int b = dialog->input_sel_end;
+    if (b < a) {
+        int tmp = a;
+        a = b;
+        b = tmp;
+    }
+    *start = a;
+    *end = b;
+}
+
+static bool fd_input_get_selection(file_dialog_t* dialog,
+                                   int* start, int* end) {
+    if (!fd_input_has_selection(dialog)) {
+        return false;
+    }
+    int s = 0;
+    int e = 0;
+    fd_input_normalize_selection(dialog, &s, &e);
+    int len = strlen(dialog->input_buffer);
+    if (s < 0) s = 0;
+    if (e > len) e = len;
+    if (s == e) {
+        return false;
+    }
+    *start = s;
+    *end = e;
+    return true;
+}
+
+static void fd_input_set_cursor_from_x(file_dialog_t* dialog, int x, int text_x) {
+    int len = strlen(dialog->input_buffer);
+    int col = (x - text_x) / 8;
+    if (col < 0) col = 0;
+    if (col > len) col = len;
+    dialog->input_cursor = col;
+}
+
+static void fd_input_copy_selection(file_dialog_t* dialog) {
+    int start = 0;
+    int end = 0;
+    if (!fd_input_get_selection(dialog, &start, &end)) {
+        uwm_clipboard_set(dialog->input_buffer);
+        return;
+    }
+    int count = end - start;
+    if (count <= 0) {
+        return;
+    }
+    char clip[sizeof(dialog->input_buffer)];
+    if (count >= (int)sizeof(clip)) {
+        count = (int)sizeof(clip) - 1;
+    }
+    memcpy(clip, dialog->input_buffer + start, (size_t)count);
+    clip[count] = '\0';
+    uwm_clipboard_set(clip);
+}
+
+static void fd_input_delete_selection(file_dialog_t* dialog) {
+    int start = 0;
+    int end = 0;
+    if (!fd_input_get_selection(dialog, &start, &end)) {
+        return;
+    }
+    int len = strlen(dialog->input_buffer);
+    if (end > len) end = len;
+    if (start < 0) start = 0;
+    for (int i = end; i <= len; i++) {
+        dialog->input_buffer[start + (i - end)] = dialog->input_buffer[i];
+    }
+    dialog->input_cursor = start;
+    fd_input_clear_selection(dialog);
+}
 
 // Refresh file list
 static void fd_refresh_list(file_dialog_t* dialog) {
@@ -153,7 +243,41 @@ static void fd_draw_ui(file_dialog_t* dialog) {
     window_fill_rect(win, 10, y, content_w - 20, FD_INPUT_HEIGHT, COLOR_WHITE);
     window_draw_rect(win, 10, y, content_w - 20, FD_INPUT_HEIGHT,
                      dialog->input_focused ? COLOR_BLUE : COLOR_BLACK);
+
+    if (dialog->input_focused && fd_input_has_selection(dialog)) {
+        int start = 0;
+        int end = 0;
+        fd_input_normalize_selection(dialog, &start, &end);
+        int len = strlen(dialog->input_buffer);
+        if (start < 0) start = 0;
+        if (end > len) end = len;
+        if (end > start) {
+            int rect_x = 15 + start * 8;
+            int rect_w = (end - start) * 8;
+            window_fill_rect(win, rect_x, y + 4, rect_w, 12, COLOR_LIGHT_BLUE);
+        }
+    }
+
     window_print(win, 15, y + 6, dialog->input_buffer, COLOR_BLACK);
+
+    if (dialog->input_focused && fd_input_has_selection(dialog)) {
+        int start = 0;
+        int end = 0;
+        fd_input_normalize_selection(dialog, &start, &end);
+        int len = strlen(dialog->input_buffer);
+        if (start < 0) start = 0;
+        if (end > len) end = len;
+        int count = end - start;
+        if (count > 0) {
+            char segment[sizeof(dialog->input_buffer)];
+            if (count >= (int)sizeof(segment)) {
+                count = (int)sizeof(segment) - 1;
+            }
+            memcpy(segment, dialog->input_buffer + start, (size_t)count);
+            segment[count] = '\0';
+            window_print(win, 15 + start * 8, y + 6, segment, COLOR_WHITE);
+        }
+    }
     
     // Draw cursor if focused
     if (dialog->input_focused) {
@@ -227,12 +351,14 @@ static void fd_navigate_to(file_dialog_t* dialog, const char* name) {
         dialog->selected_index = -1;
         dialog->scroll_offset = 0;
         fd_refresh_list(dialog);
+        fd_input_clear_selection(dialog);
         fd_draw_ui(dialog);
     } else {
         // Select file
         strncpy(dialog->input_buffer, name, sizeof(dialog->input_buffer) - 1);
         dialog->input_buffer[sizeof(dialog->input_buffer) - 1] = '\0';
         dialog->input_cursor = strlen(dialog->input_buffer);
+        fd_input_clear_selection(dialog);
         fd_draw_ui(dialog);
     }
 }
@@ -271,6 +397,43 @@ static void fd_confirm(file_dialog_t* dialog) {
     }
 }
 
+static void fd_input_insert(file_dialog_t* dialog, const char* text) {
+	if (!dialog || !text) return;
+
+	char filtered[sizeof(dialog->input_buffer)];
+	int j = 0;
+	for (int i = 0; text[i] && j < (int)sizeof(filtered) - 1; i++) {
+		if (text[i] == '\n' || text[i] == '\r') {
+			continue;
+		}
+		filtered[j++] = text[i];
+	}
+	filtered[j] = '\0';
+	if (filtered[0] == '\0') {
+		return;
+	}
+
+	int len = strlen(dialog->input_buffer);
+	int cur = dialog->input_cursor;
+	if (cur < 0) cur = 0;
+	if (cur > len) cur = len;
+
+	int space = (int)sizeof(dialog->input_buffer) - 1 - len;
+	int insert_len = strlen(filtered);
+	if (space <= 0) {
+		return;
+	}
+	if (insert_len > space) {
+		insert_len = space;
+	}
+
+	for (int i = len; i >= cur; i--) {
+		dialog->input_buffer[i + insert_len] = dialog->input_buffer[i];
+	}
+	memcpy(dialog->input_buffer + cur, filtered, (size_t)insert_len);
+	dialog->input_cursor = cur + insert_len;
+}
+
 // Cancel dialog
 static void fd_cancel(file_dialog_t* dialog) {
     if (!dialog) return;
@@ -294,7 +457,6 @@ static void fd_cancel(file_dialog_t* dialog) {
 
 // Click handler
 static void fd_on_click(window_t* win, int x, int y, int buttons) {
-    (void)buttons;
     file_dialog_t* dialog = (file_dialog_t*)window_get_user_data(win);
     if (!dialog) return;
     int content_w = window_content_width(win);
@@ -356,6 +518,7 @@ static void fd_on_click(window_t* win, int x, int y, int buttons) {
             dialog->selected_index = clicked_index;
             dialog->last_clicked_index = clicked_index;
             dialog->input_focused = false;
+            fd_input_clear_selection(dialog);
             
             // Copy filename to input buffer if it's a file
             if (!dialog->files[clicked_index].is_directory) {
@@ -373,17 +536,14 @@ static void fd_on_click(window_t* win, int x, int y, int buttons) {
     if (y >= input_y && y < input_y + FD_INPUT_HEIGHT &&
         x >= 10 && x < content_w - 10) {
         dialog->input_focused = true;
-        
-        // Calculate cursor position from click x coordinate
-        int relative_x = x - 15; // 15 is the text start x position
-        int clicked_pos = relative_x / 8; // Each character is 8 pixels wide
-        
-        // Clamp to valid range
-        if (clicked_pos < 0) clicked_pos = 0;
-        int text_len = strlen(dialog->input_buffer);
-        if (clicked_pos > text_len) clicked_pos = text_len;
-        
-        dialog->input_cursor = clicked_pos;
+        if (buttons & MOUSE_LEFT_BUTTON) {
+            fd_input_set_cursor_from_x(dialog, x, 15);
+            dialog->input_selecting = true;
+            dialog->input_sel_anchor = dialog->input_cursor;
+            dialog->input_sel_end = dialog->input_cursor;
+        } else {
+            fd_input_clear_selection(dialog);
+        }
         fd_draw_ui(dialog);
         return;
     }
@@ -401,6 +561,38 @@ static void fd_on_click(window_t* win, int x, int y, int buttons) {
             fd_cancel(dialog);
             return;
         }
+    }
+
+    if (dialog->input_focused) {
+        dialog->input_focused = false;
+        fd_input_clear_selection(dialog);
+        fd_draw_ui(dialog);
+    }
+}
+
+static void fd_on_mouse_move(window_t* win, int x, int y, int buttons) {
+    file_dialog_t* dialog = (file_dialog_t*)window_get_user_data(win);
+    (void)y;
+    if (!dialog) return;
+    if (dialog->input_focused && dialog->input_selecting && (buttons & MOUSE_LEFT_BUTTON)) {
+        fd_input_set_cursor_from_x(dialog, x, 15);
+        dialog->input_sel_end = dialog->input_cursor;
+        fd_draw_ui(dialog);
+    }
+}
+
+static void fd_on_mouse_up(window_t* win, int x, int y, int buttons) {
+    (void)x;
+    (void)y;
+    (void)buttons;
+    file_dialog_t* dialog = (file_dialog_t*)window_get_user_data(win);
+    if (!dialog) return;
+    if (dialog->input_selecting) {
+        dialog->input_selecting = false;
+        if (!fd_input_has_selection(dialog)) {
+            fd_input_clear_selection(dialog);
+        }
+        fd_draw_ui(dialog);
     }
 }
 
@@ -433,13 +625,37 @@ static void fd_on_key(window_t* win, int key) {
     
     if (dialog->input_focused) {
         // Handle input
-        if (key == '\n') {
+        if (key == 0x03) {
+            fd_input_copy_selection(dialog);
+            fd_draw_ui(dialog);
+        } else if (key == 0x18) {
+            fd_input_copy_selection(dialog);
+            if (fd_input_has_selection(dialog)) {
+                fd_input_delete_selection(dialog);
+            } else {
+                dialog->input_buffer[0] = '\0';
+                dialog->input_cursor = 0;
+                fd_input_clear_selection(dialog);
+            }
+            fd_draw_ui(dialog);
+        } else if (key == 0x16) {
+            char clip[64];
+            if (uwm_clipboard_get(clip, sizeof(clip)) > 0) {
+                if (fd_input_has_selection(dialog)) {
+                    fd_input_delete_selection(dialog);
+                }
+                fd_input_insert(dialog, clip);
+                fd_draw_ui(dialog);
+            }
+        } else if (key == '\n') {
             fd_confirm(dialog);
         } else if (key == '\b') {
             // Backspace - delete character before cursor
-            if (dialog->input_cursor > 0) {
+            if (fd_input_has_selection(dialog)) {
+                fd_input_delete_selection(dialog);
+                fd_draw_ui(dialog);
+            } else if (dialog->input_cursor > 0) {
                 int len = strlen(dialog->input_buffer);
-                // Shift text after cursor left
                 for (int i = dialog->input_cursor - 1; i < len; i++) {
                     dialog->input_buffer[i] = dialog->input_buffer[i + 1];
                 }
@@ -448,31 +664,53 @@ static void fd_on_key(window_t* win, int key) {
             }
         } else if (key == 0x7F) {
             // Delete - delete character at cursor
-            int len = strlen(dialog->input_buffer);
-            if (dialog->input_cursor < len) {
-                // Shift text after cursor left
-                for (int i = dialog->input_cursor; i < len; i++) {
-                    dialog->input_buffer[i] = dialog->input_buffer[i + 1];
-                }
+            if (fd_input_has_selection(dialog)) {
+                fd_input_delete_selection(dialog);
                 fd_draw_ui(dialog);
+            } else {
+                int len = strlen(dialog->input_buffer);
+                if (dialog->input_cursor < len) {
+                    for (int i = dialog->input_cursor; i < len; i++) {
+                        dialog->input_buffer[i] = dialog->input_buffer[i + 1];
+                    }
+                    fd_draw_ui(dialog);
+                }
             }
         } else if ((uint8_t)key == 0x82) {
             // Left arrow
-            if (dialog->input_cursor > 0) {
+            if (fd_input_has_selection(dialog)) {
+                int start = 0;
+                int end = 0;
+                fd_input_normalize_selection(dialog, &start, &end);
+                dialog->input_cursor = start;
+                fd_input_clear_selection(dialog);
+                fd_draw_ui(dialog);
+            } else if (dialog->input_cursor > 0) {
                 dialog->input_cursor--;
                 fd_draw_ui(dialog);
             }
         } else if ((uint8_t)key == 0x83) {
             // Right arrow
-            int len = strlen(dialog->input_buffer);
-            if (dialog->input_cursor < len) {
-                dialog->input_cursor++;
+            if (fd_input_has_selection(dialog)) {
+                int start = 0;
+                int end = 0;
+                fd_input_normalize_selection(dialog, &start, &end);
+                dialog->input_cursor = end;
+                fd_input_clear_selection(dialog);
                 fd_draw_ui(dialog);
+            } else {
+                int len = strlen(dialog->input_buffer);
+                if (dialog->input_cursor < len) {
+                    dialog->input_cursor++;
+                    fd_draw_ui(dialog);
+                }
             }
         } else if (key >= 32 && key < 127 && strlen(dialog->input_buffer) < 63) {
             // Insert character at cursor position
+            if (fd_input_has_selection(dialog)) {
+                fd_input_delete_selection(dialog);
+            }
             int len = strlen(dialog->input_buffer);
-            // Shift text after cursor right
             for (int i = len; i >= dialog->input_cursor; i--) {
                 dialog->input_buffer[i + 1] = dialog->input_buffer[i];
             }
@@ -492,6 +730,7 @@ static void fd_on_key(window_t* win, int key) {
                     dialog->input_buffer[sizeof(dialog->input_buffer) - 1] = '\0';
                     dialog->input_cursor = strlen(dialog->input_buffer);
                     dialog->input_focused = true;
+                    fd_input_clear_selection(dialog);
                     fd_draw_ui(dialog);
                 }
             }
@@ -553,7 +792,11 @@ void file_dialog_show_open(const char* title,
     dialog->input_cursor = 0;
     dialog->input_focused = false;
     dialog->input_buffer[0] = '\0';
+    dialog->input_selecting = false;
+    dialog->input_sel_anchor = 0;
+    dialog->input_sel_end = 0;
     dialog->last_clicked_index = -1;
+    fd_input_clear_selection(dialog);
     
     // Set path
     if (default_path && default_path[0]) {
@@ -563,7 +806,8 @@ void file_dialog_show_open(const char* title,
     }
     dialog->current_path[sizeof(dialog->current_path) - 1] = '\0';
     
-    window_set_handlers(win, fd_on_draw, fd_on_click, NULL, NULL, fd_on_scroll, fd_on_key, dialog);
+    window_set_handlers(win, fd_on_draw, fd_on_click, fd_on_mouse_up, fd_on_mouse_move,
+                        fd_on_scroll, fd_on_key, dialog);
     
     active_dialog = dialog;
     
@@ -598,6 +842,9 @@ void file_dialog_show_save(const char* title,
     dialog->input_cursor = 0;
     dialog->input_focused = true;  // Auto-focus input for save
     strcpy(dialog->current_path, "/");
+    dialog->input_selecting = false;
+    dialog->input_sel_anchor = 0;
+    dialog->input_sel_end = 0;
     dialog->last_clicked_index = -1;
     
     // Set default filename if provided
@@ -608,8 +855,10 @@ void file_dialog_show_save(const char* title,
     } else {
         dialog->input_buffer[0] = '\0';
     }
+    fd_input_clear_selection(dialog);
     
-    window_set_handlers(win, fd_on_draw, fd_on_click, NULL, NULL, fd_on_scroll, fd_on_key, dialog);
+    window_set_handlers(win, fd_on_draw, fd_on_click, fd_on_mouse_up, fd_on_mouse_move,
+                        fd_on_scroll, fd_on_key, dialog);
     
     active_dialog = dialog;
     

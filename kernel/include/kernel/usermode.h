@@ -11,6 +11,7 @@
 
 bool usermode_run_elf(const char *path);
 bool usermode_run_elf_with_args(const char *path, const char *args);
+bool usermode_run_ready(void);
 uint32_t usermode_last_exit_code(void);
 uint32_t usermode_get_args(char *dst, uint32_t max_len);
 void usermode_set_cwd(const char *path);

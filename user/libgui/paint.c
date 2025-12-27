@@ -292,6 +292,9 @@ static void paint_load_from_file(window_t* win, const char* filepath) {
     for (int y = 0; y < max_h; y++) {
         memcpy(state->canvas + y * state->canvas_w, data + y * width, (size_t)max_w);
     }
+
+    paint_draw_canvas(win);
+    paint_redraw(win);
 }
 
 static void paint_save_dialog_callback(const char* filepath, void* user_data) {

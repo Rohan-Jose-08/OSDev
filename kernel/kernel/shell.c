@@ -15,14 +15,18 @@
 #include <kernel/fs.h>
 #include <kernel/kmalloc.h>
 #include <kernel/pagings.h>
+#include <kernel/net.h>
 #include <kernel/usermode.h>
 #include <kernel/user_programs.h>
+#include <kernel/process.h>
 
 // Path length constant (previously from vfs.h)
 #define MAX_PATH_LEN 512
 
 
 #define MAX_COMMAND_LENGTH 256
+#define UDP_SHELL_MAX 512
+#define PIPELINE_MAX 6
 
 enum vga_color {
 	VGA_COLOR_BLACK = 0, VGA_COLOR_BLUE = 1, VGA_COLOR_GREEN = 2, VGA_COLOR_CYAN = 3,
@@ -199,6 +203,12 @@ static const char *builtin_commands[] = {
 	"display",
 	"edit",
 	"mem",
+	"dma",
+	"netinfo",
+	"arp",
+	"ping",
+	"udpsend",
+	"udplisten",
 	"snake",
 	"cpuinfo",
 	"rdtsc",
@@ -221,11 +231,18 @@ static const size_t builtin_command_count =
 static void output_prompt(void);
 static void input_line(char* buffer, size_t max_length);
 static void execute_command(const char* command);
+static bool execute_pipeline(const char* command);
 static bool split_command(const char *command, char *name, size_t name_len, const char **args_out);
 static bool run_user_program(const char *name, const char *args);
+static bool resolve_user_program_path(const char *name, char *out, size_t out_size);
 static void resolve_run_path(char *out, size_t out_size, const char *path);
 static void command_help(const char* args);
 static void command_memory(const char* args);
+static void command_netinfo(void);
+static void command_arp(void);
+static void command_ping(const char* args);
+static void command_udpsend(const char* args);
+static void command_udplisten(const char* args);
 static void command_snake(void);
 static void command_cpuinfo(void);
 static void command_rdtsc(void);
@@ -234,14 +251,18 @@ static void command_benchmark(void);
 static void command_display(const char* args);
 static void command_edit(const char* args);
 static void command_ps(void);
+static void command_tasks(void);
 static void command_kill(const char* args);
+static void command_killtask(const char* args);
 static void command_spawn(const char* args);
 static void command_stacktest(void);
+static void command_dma(const char* args);
 static void command_diskfmt(const char* args);
 static void command_diskmount(const char* args);
 static void command_diskls(const char* args);
 static void command_diskwrite(const char* args);
 static void command_diskread(const char* args);
+static bool is_builtin_command(const char *name);
 
 static int strcmp_local(const char* s1, const char* s2) {
 	while (*s1 && (*s1 == *s2)) { s1++; s2++; }
@@ -269,6 +290,18 @@ static void strcpy_local(char* dest, const char* src) {
 	*dest = '\0';
 }
 
+static bool is_builtin_command(const char *name) {
+	if (!name || !*name) {
+		return false;
+	}
+	for (size_t i = 0; i < builtin_command_count; i++) {
+		if (strcmp_local(name, builtin_commands[i]) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static unsigned int parse_hex(const char* str) {
 	unsigned int result = 0;
 	if (*str == '0' && (*(str+1) == 'x' || *(str+1) == 'X')) str += 2;
@@ -280,6 +313,75 @@ static unsigned int parse_hex(const char* str) {
 		else break;
 	}
 	return result;
+}
+
+static void print_ipv4(const uint8_t ip[4]) {
+	printf("%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+}
+
+static bool parse_ipv4(const char *str, uint8_t out[4], const char **rest) {
+	int part = 0;
+	unsigned int value = 0;
+	bool has_digit = false;
+
+	if (!str || !out) {
+		return false;
+	}
+
+	while (*str && *str != ' ') {
+		char c = *str;
+		if (c >= '0' && c <= '9') {
+			has_digit = true;
+			value = value * 10 + (unsigned int)(c - '0');
+			if (value > 255) {
+				return false;
+			}
+		} else if (c == '.') {
+			if (!has_digit || part >= 3) {
+				return false;
+			}
+			out[part++] = (uint8_t)value;
+			value = 0;
+			has_digit = false;
+		} else {
+			return false;
+		}
+		str++;
+	}
+
+	if (!has_digit || part != 3) {
+		return false;
+	}
+	out[part] = (uint8_t)value;
+	if (rest) {
+		*rest = str;
+	}
+	return true;
+}
+
+static bool parse_uint(const char *str, unsigned int *out, const char **rest) {
+	unsigned int value = 0;
+	bool has_digit = false;
+
+	if (!str || !out) {
+		return false;
+	}
+
+	while (*str >= '0' && *str <= '9') {
+		has_digit = true;
+		value = value * 10 + (unsigned int)(*str - '0');
+		str++;
+	}
+
+	if (!has_digit) {
+		return false;
+	}
+
+	*out = value;
+	if (rest) {
+		*rest = str;
+	}
+	return true;
 }
 
 static bool split_command(const char *command, char *name, size_t name_len, const char **args_out) {
@@ -316,6 +418,51 @@ static bool ensure_user_program_available(const char *path) {
 		return true;
 	}
 	return user_program_install_if_embedded(path);
+}
+
+static bool resolve_user_program_path(const char *name, char *out, size_t out_size) {
+	if (!name || !*name || !out || out_size == 0) {
+		return false;
+	}
+	out[0] = '\0';
+
+	bool has_slash = false;
+	for (const char *p = name; *p; p++) {
+		if (*p == '/') {
+			has_slash = true;
+			break;
+		}
+	}
+
+	size_t name_len = strlen(name);
+	bool has_elf = name_len > 4 && strcmp(name + name_len - 4, ".elf") == 0;
+
+	if (has_slash) {
+		resolve_run_path(out, out_size, name);
+		return ensure_user_program_available(out);
+	}
+
+	if (has_elf) {
+		snprintf(out, out_size, "/bin/%s", name);
+		if (ensure_user_program_available(out)) {
+			return true;
+		}
+		resolve_run_path(out, out_size, name);
+		return ensure_user_program_available(out);
+	}
+
+	snprintf(out, out_size, "/bin/%s.elf", name);
+	if (ensure_user_program_available(out)) {
+		return true;
+	}
+
+	resolve_run_path(out, out_size, name);
+	if (ensure_user_program_available(out)) {
+		return true;
+	}
+
+	snprintf(out, out_size, "/bin/%s", name);
+	return ensure_user_program_available(out);
 }
 
 static bool run_user_attempt(const char *path, const char *args) {
@@ -631,6 +778,123 @@ static void input_line(char* buffer, size_t max_length) {
 	}
 }
 
+static bool execute_pipeline(const char* command) {
+	if (!command || !strchr(command, '|')) {
+		return false;
+	}
+
+	char buffer[MAX_COMMAND_LENGTH];
+	strncpy(buffer, command, sizeof(buffer) - 1);
+	buffer[sizeof(buffer) - 1] = '\0';
+
+	char *segments[PIPELINE_MAX];
+	int count = 0;
+	char *cursor = buffer;
+	while (*cursor && count < PIPELINE_MAX) {
+		while (*cursor == ' ') {
+			cursor++;
+		}
+		if (*cursor == '\0') {
+			break;
+		}
+		segments[count++] = cursor;
+		char *bar = strchr(cursor, '|');
+		if (!bar) {
+			break;
+		}
+		*bar = '\0';
+		cursor = bar + 1;
+	}
+	if (count == PIPELINE_MAX && strchr(cursor, '|')) {
+		printf("Pipeline too long.\n");
+		return true;
+	}
+
+	for (int i = 0; i < count; i++) {
+		char *seg = segments[i];
+		while (*seg == ' ') {
+			seg++;
+		}
+		size_t len = strlen(seg);
+		while (len > 0 && seg[len - 1] == ' ') {
+			seg[--len] = '\0';
+		}
+		if (len == 0) {
+			printf("Invalid pipeline segment.\n");
+			return true;
+		}
+		segments[i] = seg;
+	}
+
+	if (count < 2) {
+		return false;
+	}
+
+	char names[PIPELINE_MAX][MAX_COMMAND_LENGTH];
+	const char *args[PIPELINE_MAX];
+	char paths[PIPELINE_MAX][MAX_PATH_LEN];
+	for (int i = 0; i < count; i++) {
+		if (!split_command(segments[i], names[i], sizeof(names[i]), &args[i])) {
+			printf("Invalid pipeline command.\n");
+			return true;
+		}
+		if (is_builtin_command(names[i])) {
+			printf("Pipelines only support user programs.\n");
+			return true;
+		}
+		if (!resolve_user_program_path(names[i], paths[i], sizeof(paths[i]))) {
+			printf("Unknown command in pipeline: %s\n", names[i]);
+			return true;
+		}
+	}
+
+	process_t *procs[PIPELINE_MAX] = {0};
+	for (int i = 0; i < count; i++) {
+		uint32_t args_len = (uint32_t)strlen(args[i]);
+		procs[i] = process_spawn_proc(paths[i], args[i], args_len);
+		if (!procs[i]) {
+			printf("Failed to spawn pipeline command: %s\n", names[i]);
+			for (int j = 0; j < i; j++) {
+				process_kill_other(procs[j]->pid, 1);
+			}
+			return true;
+		}
+	}
+
+	pipe_t *pipes[PIPELINE_MAX - 1] = {0};
+	for (int i = 0; i < count - 1; i++) {
+		pipes[i] = pipe_create();
+		if (!pipes[i]) {
+			printf("Failed to allocate pipe.\n");
+			for (int k = 0; k < i; k++) {
+				if (pipes[k]) {
+					pipe_release_read(pipes[k]);
+				}
+			}
+			for (int j = 0; j < count; j++) {
+				if (procs[j]) {
+					process_kill_other(procs[j]->pid, 1);
+				}
+			}
+			return true;
+		}
+	}
+
+	for (int i = 0; i < count; i++) {
+		if (i > 0) {
+			process_fd_set_pipe(procs[i], 0, pipes[i - 1], false);
+		}
+		if (i < count - 1) {
+			process_fd_set_pipe(procs[i], 1, pipes[i], true);
+		}
+	}
+
+	if (!usermode_run_ready()) {
+		printf("Failed to run pipeline.\n");
+	}
+	return true;
+}
+
 static void execute_command(const char* command) {
 	// Check aliases first
 	for (int i = 0; i < alias_count; i++) {
@@ -639,19 +903,31 @@ static void execute_command(const char* command) {
 			return;
 		}
 	}
+
+	if (execute_pipeline(command)) {
+		return;
+	}
 	
 	static const command_entry_t command_table[] = {
 		{"help", NULL, command_help, true},
 		{"display", NULL, command_display, true},
 		{"edit", NULL, command_edit, true},
 		{"mem", NULL, command_memory, true},
+		{"dma", NULL, command_dma, true},
+		{"netinfo", command_netinfo, NULL, false},
+		{"arp", command_arp, NULL, false},
+		{"ping", NULL, command_ping, true},
+		{"udpsend", NULL, command_udpsend, true},
+		{"udplisten", NULL, command_udplisten, true},
 		{"snake", command_snake, NULL, false},
 		{"cpuinfo", command_cpuinfo, NULL, false},
 		{"rdtsc", command_rdtsc, NULL, false},
 		{"regs", command_regs, NULL, false},
 		{"benchmark", command_benchmark, NULL, false},
 		{"ps", command_ps, NULL, false},
+		{"tasks", command_tasks, NULL, false},
 		{"kill", NULL, command_kill, true},
+		{"killtask", NULL, command_killtask, true},
 		{"spawn", NULL, command_spawn, true},
 		{"stacktest", command_stacktest, NULL, false},
 		{"diskfmt", NULL, command_diskfmt, true},
@@ -716,14 +992,22 @@ static void command_help(const char* args) {
 	printf("  display <mode>   - Set display mode or show info\n");
 	printf("  edit <file>      - Text editor\n");
 	printf("  mem [addr|heap]  - Heap stats or memory dump\n");
+	printf("  dma <on|off|toggle|status> - Toggle ATA DMA (saved to /etc/boot.cfg)\n");
+	printf("  netinfo          - Show network configuration\n");
+	printf("  arp              - Show ARP table\n");
+	printf("  ping <ip>        - Send ICMP echo request\n");
+	printf("  udpsend <ip> <port> <text> - Send UDP payload\n");
+	printf("  udplisten <port> [timeout_ms] - Wait for UDP packet\n");
 	printf("  snake            - Play Snake (kernel demo)\n");
 	printf("  cpuinfo          - Detailed CPU info\n");
 	printf("  rdtsc            - Read timestamp counter\n");
 	printf("  regs             - Show control registers\n");
 	printf("  benchmark        - CPU benchmark\n");
-	printf("  ps               - List running tasks\n");
-	printf("  kill <pid>       - Terminate task\n");
-	printf("  spawn <demo>     - Spawn demo task (demo1|demo2|demo3)\n");
+	printf("  ps               - List user processes\n");
+	printf("  tasks            - List kernel threads\n");
+	printf("  kill <pid>       - Terminate user process\n");
+	printf("  killtask <tid>   - Terminate kernel thread\n");
+	printf("  spawn <demo>     - Spawn demo kernel thread (demo1|demo2|demo3)\n");
 	printf("  stacktest        - Trigger kernel stack overflow (guard page)\n");
 	printf("  fault            - Trigger user-mode page fault test\n");
 	printf("  diskfmt <n>      - Format drive (0-3)\n");
@@ -732,6 +1016,7 @@ static void command_help(const char* args) {
 	printf("  diskwrite <f> <text> - Write file to disk\n");
 	printf("  diskread <f>     - Read file from disk\n");
 	printf("\nTip: use \"help kernel\" to skip user-mode help.\n\n");
+	printf("Pipelines: user programs can be chained with '|'.\n\n");
 }
 
 static void command_memory(const char* args) {
@@ -783,6 +1068,189 @@ static void command_memory(const char* args) {
 		printf("\n");
 	}
 	printf("\n");
+}
+
+static void command_netinfo(void) {
+	net_print_info();
+}
+
+static void command_arp(void) {
+	net_print_arp_table();
+}
+
+static void command_ping(const char* args) {
+	while (*args == ' ') {
+		args++;
+	}
+	if (*args == '\0') {
+		printf("Usage: ping <ip> [count]\n");
+		return;
+	}
+
+	uint8_t ip[4];
+	const char *rest = args;
+	if (!parse_ipv4(args, ip, &rest)) {
+		printf("Invalid IP address.\n");
+		return;
+	}
+
+	while (*rest == ' ') {
+		rest++;
+	}
+
+	unsigned int count = 4;
+	if (*rest) {
+		unsigned int value = 0;
+		bool has_digit = false;
+		while (*rest >= '0' && *rest <= '9') {
+			has_digit = true;
+			value = value * 10 + (unsigned int)(*rest - '0');
+			rest++;
+		}
+		if (has_digit && value > 0) {
+			count = value;
+		}
+	}
+
+	if (count > 16) {
+		count = 16;
+	}
+
+	printf("PING ");
+	print_ipv4(ip);
+	printf(" (%u packets)\n", count);
+
+	for (unsigned int i = 0; i < count; i++) {
+		uint32_t rtt_ms = 0;
+		bool ok = net_ping(ip, 1000, &rtt_ms);
+		if (ok) {
+			printf("Reply from ");
+			print_ipv4(ip);
+			printf(": time=%u ms\n", rtt_ms);
+		} else {
+			printf("Request timed out.\n");
+		}
+		if (i + 1 < count) {
+			timer_sleep_ms(1000);
+		}
+	}
+}
+
+static void command_udpsend(const char* args) {
+	while (*args == ' ') {
+		args++;
+	}
+	if (*args == '\0') {
+		printf("Usage: udpsend <ip> <port> <text>\n");
+		return;
+	}
+
+	uint8_t ip[4];
+	const char *rest = args;
+	if (!parse_ipv4(args, ip, &rest)) {
+		printf("Invalid IP address.\n");
+		return;
+	}
+
+	while (*rest == ' ') {
+		rest++;
+	}
+
+	unsigned int port = 0;
+	if (!parse_uint(rest, &port, &rest) || port > 65535) {
+		printf("Invalid port.\n");
+		return;
+	}
+
+	while (*rest == ' ') {
+		rest++;
+	}
+	if (*rest == '\0') {
+		printf("Usage: udpsend <ip> <port> <text>\n");
+		return;
+	}
+
+	size_t len = strlen(rest);
+	if (len > UDP_SHELL_MAX) {
+		len = UDP_SHELL_MAX;
+	}
+
+	if (!net_udp_send(ip, (uint16_t)port, (const uint8_t *)rest, (uint16_t)len)) {
+		printf("UDP send failed.\n");
+		return;
+	}
+
+	printf("Sent %u bytes to ", (unsigned int)len);
+	print_ipv4(ip);
+	printf(":%u\n", port);
+}
+
+static void command_udplisten(const char* args) {
+	while (*args == ' ') {
+		args++;
+	}
+	if (*args == '\0') {
+		printf("Usage: udplisten <port> [timeout_ms]\n");
+		return;
+	}
+
+	unsigned int port = 0;
+	const char *rest = args;
+	if (!parse_uint(rest, &port, &rest) || port > 65535) {
+		printf("Invalid port.\n");
+		return;
+	}
+
+	while (*rest == ' ') {
+		rest++;
+	}
+
+	unsigned int timeout_ms = 5000;
+	if (*rest) {
+		unsigned int value = 0;
+		if (parse_uint(rest, &value, &rest)) {
+			timeout_ms = value;
+		}
+	}
+
+	if (!net_udp_listen((uint16_t)port)) {
+		printf("Failed to listen on UDP port %u.\n", port);
+		return;
+	}
+	printf("Listening on UDP port %u...\n", port);
+
+	uint32_t remaining = timeout_ms;
+	uint8_t payload[UDP_SHELL_MAX];
+	uint16_t payload_len = UDP_SHELL_MAX;
+	uint8_t src_ip[4] = {0};
+	uint16_t src_port = 0;
+
+	while (remaining > 0) {
+		payload_len = UDP_SHELL_MAX;
+		if (net_udp_recv((uint16_t)port, payload, &payload_len, src_ip, &src_port)) {
+			printf("UDP ");
+			print_ipv4(src_ip);
+			printf(":%u %u bytes: ", src_port, payload_len);
+			for (uint16_t i = 0; i < payload_len; i++) {
+				unsigned char c = payload[i];
+				if (c >= 32 && c < 127) {
+					printf("%c", c);
+				} else {
+					printf(".");
+				}
+			}
+			printf("\n");
+			return;
+		}
+		timer_sleep_ms(10);
+		if (remaining > 10) {
+			remaining -= 10;
+		} else {
+			remaining = 0;
+		}
+	}
+
+	printf("UDP listen timed out.\n");
 }
 
 static void command_snake(void) {
@@ -1052,7 +1520,7 @@ static void command_display(const char* args) {
 	}
 }
 
-// Demo task functions
+// Demo kernel thread functions
 static void demo_task_1(void) {
 	for (int i = 0; i < 10; i++) {
 		printf("[Task 1] Iteration %d\n", i);
@@ -1080,34 +1548,75 @@ static void demo_task_3(void) {
 	task_exit();
 }
 
+static const char *process_state_label(uint8_t state) {
+	switch (state) {
+		case PROCESS_READY: return "READY";
+		case PROCESS_RUNNING: return "RUNNING";
+		case PROCESS_BLOCKED: return "BLOCKED";
+		case PROCESS_ZOMBIE: return "ZOMBIE";
+		default: return "UNKNOWN";
+	}
+}
+
 // Process list command
 static void command_ps(void) {
+	enum { PROCESS_LIST_MAX = 32 };
+	process_info_t list[PROCESS_LIST_MAX];
+	uint32_t count = process_list(list, PROCESS_LIST_MAX);
+
+	printf("PID\tState\t\tPrio\tSlice\tTime\tName\n");
+	printf("---\t--------\t----\t-----\t----\t--------------------------------\n");
+	for (uint32_t i = 0; i < count; i++) {
+		const process_info_t *info = &list[i];
+		printf("%u\t%s\t%u\t%u\t%u\t%s\n",
+		       info->pid,
+		       process_state_label(info->state),
+		       info->priority,
+		       info->time_slice,
+		       info->total_time,
+		       info->name);
+	}
+	if (count == 0) {
+		printf("(no user processes)\n");
+	}
+}
+
+// Kernel task list command
+static void command_tasks(void) {
 	task_list();
 }
 
 // Kill process command
 static void command_kill(const char* args) {
-	if (!args || strlen(args) == 0) {
+	unsigned int pid = 0;
+	while (args && *args == ' ') {
+		args++;
+	}
+	if (!parse_uint(args, &pid, NULL) || pid == 0) {
 		printf("Usage: kill <pid>\n");
 		return;
 	}
-	
-	// Simple atoi implementation
-	uint32_t pid = 0;
-	while (*args >= '0' && *args <= '9') {
-		pid = pid * 10 + (*args - '0');
-		args++;
-	}
-	
-	if (pid == 0) {
-		printf("Invalid PID\n");
+
+	if (process_kill_other((uint32_t)pid, 128 + 15)) {
+		printf("Process %u killed\n", pid);
 		return;
 	}
-	
-	if (task_kill(pid)) {
-		printf("Task %u killed\n", pid);
-	} else {
-		printf("Task %u not found\n", pid);
+	printf("Process %u not found\n", pid);
+}
+
+// Kill kernel task command
+static void command_killtask(const char* args) {
+	unsigned int tid = 0;
+	while (args && *args == ' ') {
+		args++;
+	}
+	if (!parse_uint(args, &tid, NULL) || tid == 0) {
+		printf("Usage: killtask <tid>\n");
+		return;
+	}
+
+	if (!task_kill((uint32_t)tid)) {
+		printf("Kernel thread %u not found\n", tid);
 	}
 }
 
@@ -1127,13 +1636,13 @@ static void command_spawn(const char* args) {
 	} else if (strcmp(args, "demo3") == 0) {
 		task = task_create("Demo Task 3", demo_task_3, 1);
 	} else {
-		printf("Unknown task: %s\n", args);
+		printf("Unknown demo: %s\n", args);
 		printf("Available: demo1, demo2, demo3\n");
 		return;
 	}
 	
 	if (!task) {
-		printf("Failed to create task\n");
+		printf("Failed to create kernel thread\n");
 	}
 }
 
@@ -1160,6 +1669,75 @@ static void command_stacktest(void) {
 		return;
 	}
 	task_yield();
+}
+
+static void persist_dma_setting(bool enabled) {
+	fs_context_t *fs = fs_get_context();
+	if (!fs || !fs->mounted) {
+		printf("Warning: filesystem not mounted; DMA setting not saved\n");
+		return;
+	}
+	fs_create_dir("/etc");
+	int create_res = fs_create_file("/etc/boot.cfg");
+	if (create_res < 0 && create_res != -2) {
+		printf("Warning: failed to create /etc/boot.cfg\n");
+		return;
+	}
+	const char *line = enabled ? "dma=on\n" : "dma=off\n";
+	if (fs_write_file("/etc/boot.cfg", (const uint8_t *)line, strlen(line), 0) < 0) {
+		printf("Warning: failed to write /etc/boot.cfg\n");
+	}
+}
+
+static void command_dma(const char* args) {
+	if (!args) {
+		args = "";
+	}
+	while (*args == ' ') {
+		args++;
+	}
+
+	char mode[16];
+	size_t idx = 0;
+	while (*args && *args != ' ' && idx < sizeof(mode) - 1) {
+		mode[idx++] = *args++;
+	}
+	mode[idx] = '\0';
+
+	if (mode[0] == '\0' || strcmp_local(mode, "status") == 0) {
+		printf("ATA DMA is %s\n", ata_dma_is_enabled() ? "enabled" : "disabled");
+		printf("Usage: dma <on|off|toggle|status>\n");
+		return;
+	}
+
+	if (strcmp_local(mode, "on") == 0 || strcmp_local(mode, "enable") == 0) {
+		ata_device_t *dev = ata_get_device(0);
+		if (dev && !dev->dma_supported) {
+			printf("Warning: drive 0 does not report DMA capability\n");
+		}
+		ata_set_dma_enabled(true);
+		persist_dma_setting(true);
+		printf("ATA DMA enabled (will validate on next write)\n");
+		return;
+	}
+
+	if (strcmp_local(mode, "off") == 0 || strcmp_local(mode, "disable") == 0) {
+		ata_set_dma_enabled(false);
+		persist_dma_setting(false);
+		printf("ATA DMA disabled\n");
+		return;
+	}
+
+	if (strcmp_local(mode, "toggle") == 0) {
+		bool enabled = !ata_dma_is_enabled();
+		ata_set_dma_enabled(enabled);
+		persist_dma_setting(enabled);
+		printf("ATA DMA %s (will validate on next write)\n",
+		       enabled ? "enabled" : "disabled");
+		return;
+	}
+
+	printf("Usage: dma <on|off|toggle|status>\n");
 }
 
 // Run user-mode ELF program

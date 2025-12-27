@@ -10,6 +10,8 @@ typedef void (*uwm_draw_fn)(uwm_window_t*);
 typedef void (*uwm_mouse_fn)(uwm_window_t*, int, int, int);
 typedef void (*uwm_scroll_fn)(uwm_window_t*, int);
 typedef void (*uwm_key_fn)(uwm_window_t*, int);
+typedef void (*uwm_tick_fn)(uwm_window_t*, uint32_t);
+typedef void (*uwm_close_fn)(uwm_window_t*);
 typedef bool (*uwm_hit_fn)(int, int);
 
 bool uwm_init(uint8_t mode);
@@ -21,10 +23,20 @@ void uwm_set_background_input(uwm_mouse_fn down_fn,
                                uwm_scroll_fn scroll_fn,
                                uwm_key_fn key_fn,
                                uwm_hit_fn capture_fn);
+void uwm_request_redraw(void);
 void uwm_run(void);
 void uwm_quit(void);
 
 uwm_window_t* uwm_window_create(int x, int y, int width, int height, const char* title);
+int uwm_window_count(void);
+uwm_window_t* uwm_window_get_at(int index);
+const char* uwm_window_get_title(uwm_window_t* win);
+bool uwm_window_is_focused(uwm_window_t* win);
+bool uwm_window_is_minimized(uwm_window_t* win);
+void uwm_window_set_minimized(uwm_window_t* win, bool minimized);
+void uwm_window_focus(uwm_window_t* win);
+int uwm_clipboard_set(const char* text);
+int uwm_clipboard_get(char* out, int out_len);
 void uwm_window_set_handlers(uwm_window_t* win,
                              uwm_draw_fn draw_fn,
                              uwm_mouse_fn down_fn,
@@ -33,6 +45,8 @@ void uwm_window_set_handlers(uwm_window_t* win,
                              uwm_scroll_fn scroll_fn,
                              uwm_key_fn key_fn,
                              void* user_data);
+void uwm_window_set_tick_handler(uwm_window_t* win, uwm_tick_fn tick_fn);
+void uwm_window_set_close_handler(uwm_window_t* win, uwm_close_fn close_fn);
 void uwm_window_destroy(uwm_window_t* win);
 void* uwm_window_get_user(uwm_window_t* win);
 void uwm_window_set_user(uwm_window_t* win, void* user_data);

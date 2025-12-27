@@ -36,8 +36,8 @@ static volatile uint32_t timer_ticks = 0;
 void timer_handler(trap_frame_t *frame) {
     timer_ticks++;
     
-    // Call the scheduler tick
-    scheduler_tick();
+    // Tick the kernel task scheduler (kernel threads)
+    task_scheduler_tick();
     process_tick(timer_ticks);
     process_schedule(frame);
 }

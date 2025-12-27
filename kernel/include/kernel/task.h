@@ -7,6 +7,9 @@
 #define MAX_TASKS 64
 #define TASK_KERNEL_STACK_SIZE 8192
 
+// Kernel tasks (kernel threads) run in ring 0 and are scheduled separately
+// from user processes (see process.h/process.c).
+
 // Task states
 typedef enum {
     TASK_READY = 0,      // Ready to run
@@ -41,8 +44,8 @@ typedef struct task {
     struct task *next;              // Next task in queue
 } task_t;
 
-// Initialize the task scheduler
-void scheduler_init(void);
+// Initialize the kernel task scheduler
+void task_scheduler_init(void);
 
 // Create a new task
 task_t* task_create(const char *name, void (*entry_point)(void), uint32_t priority);
@@ -63,7 +66,7 @@ void task_unblock(task_t *task);
 task_t* task_current(void);
 
 // Switch to next task (called by timer interrupt)
-void scheduler_tick(void);
+void task_scheduler_tick(void);
 
 // Context switch function (implemented in assembly)
 extern void context_switch(registers_t *old_regs, registers_t *new_regs);

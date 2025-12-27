@@ -16,6 +16,8 @@ export INCLUDEDIR=$PREFIX/include
 
 export CFLAGS='-O2 -g'
 export CPPFLAGS=''
+export ATA_DMA=${ATA_DMA:-0}
+export ATA_DMA_VERIFY=${ATA_DMA_VERIFY:-1}
 
 # Configure the cross-compiler to use the desired system root.
 export SYSROOT="$(pwd)/sysroot"

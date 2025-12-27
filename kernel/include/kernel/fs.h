@@ -11,13 +11,14 @@
 // Sector K+1-M: Data blocks
 
 #define FS_MAGIC 0x524F4853  // "ROHS" - RohanOS
-#define FS_VERSION 2
+#define FS_VERSION 5
 #define FS_BLOCK_SIZE 512
 #define FS_MAX_INODES 256
 #define FS_MAX_FILENAME 28
-#define FS_INODE_BLOCKS 12  // Total block pointers per inode
-#define FS_DIRECT_BLOCKS 11  // Direct block pointers (blocks[0-10])
-#define FS_INDIRECT_BLOCK 11  // Indirect block pointer (blocks[11])
+#define FS_INODE_BLOCKS 50  // Total block pointers per inode
+#define FS_DIRECT_BLOCKS 48  // Direct block pointers (blocks[0-47])
+#define FS_INDIRECT_BLOCK 48  // Indirect block pointer (blocks[48])
+#define FS_DOUBLE_INDIRECT_BLOCK 49  // Double-indirect block pointer (blocks[49])
 #define FS_PTRS_PER_BLOCK (FS_BLOCK_SIZE / sizeof(uint32_t))  // 128 pointers per block
 
 // Filesystem superblock (sector 0)
@@ -36,13 +37,24 @@ typedef struct {
     uint8_t reserved[468];       // Pad to 512 bytes
 } __attribute__((packed)) fs_superblock_t;
 
+// Permission bits (rwx in lowest 9 bits, legacy values <= 0x7 apply to all).
+#define FS_PERM_READ  0x4
+#define FS_PERM_WRITE 0x2
+#define FS_PERM_EXEC  0x1
+
 // Filesystem inode
 typedef struct {
     uint32_t size;               // File size in bytes
+    uint16_t permissions;        // Permission bits
     uint8_t type;                // 0 = free, 1 = file, 2 = directory
-    uint8_t permissions;         // Permission bits
+    uint8_t reserved;            // Padding
     uint16_t parent_inode;       // Parent directory inode (0 for root)
-    uint32_t blocks[FS_INODE_BLOCKS]; // blocks[0-10]=direct, blocks[11]=indirect
+    uint16_t uid;                // Owner UID
+    uint16_t gid;                // Owner GID
+    uint32_t atime;              // Access time (ticks)
+    uint32_t mtime;              // Modify time (ticks)
+    uint32_t ctime;              // Status change time (ticks)
+    uint32_t blocks[FS_INODE_BLOCKS]; // blocks[0-47]=direct, blocks[48]=indirect, blocks[49]=double-indirect
     char name[FS_MAX_FILENAME];  // Filename
 } __attribute__((packed)) fs_inode_t;
 
@@ -67,6 +79,7 @@ typedef struct {
     uint32_t bitmap_dirty_bytes; // Size of dirty flag array
     bool defer_bitmap_flush;     // Defer bitmap flush during bulk writes
     uint16_t next_free_inode;    // Hint index for next free inode search
+    uint16_t max_inodes;         // Maximum inodes supported by on-disk layout
 } fs_context_t;
 
 // Initialize filesystem driver

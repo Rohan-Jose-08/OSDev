@@ -142,6 +142,69 @@ int beep(uint32_t frequency_hz, uint32_t duration_ms) {
 	return syscall3(SYSCALL_BEEP, frequency_hz, duration_ms, 0);
 }
 
+void speaker_start(uint32_t frequency_hz) {
+	syscall3(SYSCALL_SPEAKER_START, frequency_hz, 0, 0);
+}
+
+void speaker_stop(void) {
+	syscall3(SYSCALL_SPEAKER_STOP, 0, 0, 0);
+}
+
+int audio_write(const void *buf, uint32_t bytes) {
+	return syscall3(SYSCALL_AUDIO_WRITE, (uint32_t)buf, bytes, 0);
+}
+
+int audio_set_volume(uint8_t master, uint8_t pcm) {
+	return syscall3(SYSCALL_AUDIO_SET_VOLUME, master, pcm, 0);
+}
+
+int audio_get_volume(uint8_t *master, uint8_t *pcm) {
+	uint32_t res = (uint32_t)syscall3(SYSCALL_AUDIO_GET_VOLUME, 0, 0, 0);
+	if (res == (uint32_t)-1) {
+		return -1;
+	}
+	if (master) {
+		*master = (uint8_t)(res & 0xFF);
+	}
+	if (pcm) {
+		*pcm = (uint8_t)((res >> 8) & 0xFF);
+	}
+	return 0;
+}
+
+int audio_is_ready(void) {
+	return (int)syscall3(SYSCALL_AUDIO_STATUS, 0, 0, 0);
+}
+
+uint32_t fs_get_free_blocks(void) {
+	return (uint32_t)syscall3(SYSCALL_FS_FREE_BLOCKS, 0, 0, 0);
+}
+
+int heap_get_stats(user_heap_stats_t *stats) {
+	if (!stats) {
+		return -1;
+	}
+	return syscall3(SYSCALL_HEAP_STATS, (uint32_t)stats, sizeof(*stats), 0);
+}
+
+uint32_t process_count(void) {
+	return (uint32_t)syscall3(SYSCALL_PROCESS_COUNT, 0, 0, 0);
+}
+
+int process_list(user_process_info_t *out, uint32_t max_entries) {
+	if (!out || max_entries == 0) {
+		return -1;
+	}
+	return syscall3(SYSCALL_PROCESS_LIST, (uint32_t)out, max_entries, 0);
+}
+
+int install_embedded(const char *path) {
+	if (!path) {
+		return -1;
+	}
+	return syscall3(SYSCALL_INSTALL_EMBEDDED, (uint32_t)path, 0, 0);
+}
+
 int halt(void) {
 	return syscall3(SYSCALL_HALT, 0, 0, 0);
 }
@@ -180,4 +243,68 @@ int gui_filemgr(void) {
 
 int keyboard_has_input(void) {
 	return syscall3(SYSCALL_KEYBOARD_HAS_INPUT, 0, 0, 0);
+}
+
+int keyboard_set_repeat(uint8_t delay, uint8_t rate) {
+	return syscall3(SYSCALL_KEY_REPEAT, (uint32_t)delay, (uint32_t)rate, 0);
+}
+
+static uint32_t user_break = 0;
+
+static uint32_t fetch_break(void) {
+	if (user_break == 0) {
+		uint32_t res = (uint32_t)syscall3(SYSCALL_BRK, 0, 0, 0);
+		if (res == (uint32_t)-1) {
+			return (uint32_t)-1;
+		}
+		user_break = res;
+	}
+	return user_break;
+}
+
+void *sbrk(intptr_t increment) {
+	uint32_t cur = fetch_break();
+	if (cur == (uint32_t)-1) {
+		return (void *)-1;
+	}
+	if (increment == 0) {
+		return (void *)cur;
+	}
+
+	int32_t inc = (int32_t)increment;
+	uint32_t new_end = cur + inc;
+	if ((inc > 0 && new_end < cur) || (inc < 0 && new_end > cur)) {
+		return (void *)-1;
+	}
+
+	uint32_t res = (uint32_t)syscall3(SYSCALL_BRK, new_end, 0, 0);
+	if (res == (uint32_t)-1) {
+		return (void *)-1;
+	}
+	user_break = res;
+	return (void *)cur;
+}
+
+int brk(void *addr) {
+	uint32_t res = (uint32_t)syscall3(SYSCALL_BRK, (uint32_t)addr, 0, 0);
+	if (res == (uint32_t)-1) {
+		return -1;
+	}
+	user_break = res;
+	return 0;
+}
+
+int pipe(int fds[2]) {
+	if (!fds) {
+		return -1;
+	}
+	return syscall3(SYSCALL_PIPE, (uint32_t)fds, 0, 0);
+}
+
+int dup2(int oldfd, int newfd) {
+	return syscall3(SYSCALL_DUP2, (uint32_t)oldfd, (uint32_t)newfd, 0);
+}
+
+int kill(int pid, int sig) {
+	return syscall3(SYSCALL_KILL, (uint32_t)pid, (uint32_t)sig, 0);
 }

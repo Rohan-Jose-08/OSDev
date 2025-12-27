@@ -32,14 +32,7 @@ static void usermode_set_args(const char *args, uint32_t len) {
 	current_args_len = len;
 }
 
-bool usermode_run_elf_impl(const char *path) {
-	syscall_reset_exit();
-
-	int pid = process_spawn(path, current_args, current_args_len);
-	if (pid < 0) {
-		return false;
-	}
-
+static bool usermode_run_scheduler(void) {
 	if (process_scheduler_is_active()) {
 		if (process_current()) {
 			return true;
@@ -72,6 +65,16 @@ bool usermode_run_elf_impl(const char *path) {
 	return true;
 }
 
+bool usermode_run_elf_impl(const char *path) {
+	syscall_reset_exit();
+
+	int pid = process_spawn(path, current_args, current_args_len);
+	if (pid < 0) {
+		return false;
+	}
+	return usermode_run_scheduler();
+}
+
 uint32_t usermode_last_exit_code(void) {
 	return syscall_exit_status();
 }
@@ -82,6 +85,11 @@ bool usermode_run_elf_with_args(const char *path, const char *args) {
 	}
 	usermode_set_args(args, args ? (uint32_t)strlen(args) : 0);
 	return usermode_run_elf(path);
+}
+
+bool usermode_run_ready(void) {
+	syscall_reset_exit();
+	return usermode_run_scheduler();
 }
 
 uint32_t usermode_get_args(char *dst, uint32_t max_len) {

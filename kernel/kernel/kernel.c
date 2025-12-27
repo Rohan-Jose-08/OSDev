@@ -19,9 +19,107 @@
 #include <kernel/kpti.h>
 #include <kernel/user_programs.h>
 #include <kernel/process.h>
+#include <kernel/net.h>
+#include <kernel/audio.h>
 
 #include <stdint.h>
 #include <stddef.h> 
+
+#define SAMPLE_PPM_W 8
+#define SAMPLE_PPM_H 8
+#define SAMPLE_PGM_W 16
+#define SAMPLE_PGM_H 8
+#define SAMPLE_PNT_W 16
+#define SAMPLE_PNT_H 16
+
+#define PAINT_FILE_MAGIC 0x544E4950
+#define PAINT_FILE_VERSION 1
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t width;
+    uint16_t height;
+    uint16_t reserved;
+} __attribute__((packed)) paint_file_header_t;
+
+static bool sample_file_exists(const char *path) {
+    fs_inode_t inode;
+    return fs_stat(path, &inode) && inode.type == 1;
+}
+
+static void sample_write_file(const char *path, const uint8_t *data, uint32_t size) {
+    if (!path || !data || size == 0) {
+        return;
+    }
+    if (sample_file_exists(path)) {
+        return;
+    }
+    int res = fs_create_file(path);
+    if (res < 0 && res != -2) {
+        return;
+    }
+    fs_write_file(path, data, size, 0);
+}
+
+static void create_sample_images(void) {
+    fs_create_dir("/samples");
+
+    uint8_t ppm_data[32 + SAMPLE_PPM_W * SAMPLE_PPM_H * 3];
+    char ppm_header[32];
+    int ppm_header_len = snprintf(ppm_header, sizeof(ppm_header), "P6\n%d %d\n255\n",
+                                  SAMPLE_PPM_W, SAMPLE_PPM_H);
+    if (ppm_header_len > 0) {
+        memcpy(ppm_data, ppm_header, (size_t)ppm_header_len);
+        uint8_t *pix = ppm_data + ppm_header_len;
+        for (int y = 0; y < SAMPLE_PPM_H; y++) {
+            for (int x = 0; x < SAMPLE_PPM_W; x++) {
+                uint8_t r = (x < SAMPLE_PPM_W / 2) ? 255 : 0;
+                uint8_t g = (y < SAMPLE_PPM_H / 2) ? 255 : 0;
+                uint8_t b = ((x + y) & 1) ? 255 : 0;
+                *pix++ = r;
+                *pix++ = g;
+                *pix++ = b;
+            }
+        }
+        uint32_t ppm_size = (uint32_t)ppm_header_len + SAMPLE_PPM_W * SAMPLE_PPM_H * 3;
+        sample_write_file("/samples/sample.ppm", ppm_data, ppm_size);
+    }
+
+    uint8_t pgm_data[32 + SAMPLE_PGM_W * SAMPLE_PGM_H];
+    char pgm_header[32];
+    int pgm_header_len = snprintf(pgm_header, sizeof(pgm_header), "P5\n%d %d\n255\n",
+                                  SAMPLE_PGM_W, SAMPLE_PGM_H);
+    if (pgm_header_len > 0) {
+        memcpy(pgm_data, pgm_header, (size_t)pgm_header_len);
+        uint8_t *pix = pgm_data + pgm_header_len;
+        for (int y = 0; y < SAMPLE_PGM_H; y++) {
+            for (int x = 0; x < SAMPLE_PGM_W; x++) {
+                uint8_t v = (uint8_t)((x * 255) / (SAMPLE_PGM_W - 1));
+                *pix++ = v;
+            }
+        }
+        uint32_t pgm_size = (uint32_t)pgm_header_len + SAMPLE_PGM_W * SAMPLE_PGM_H;
+        sample_write_file("/samples/sample.pgm", pgm_data, pgm_size);
+    }
+
+    uint8_t pnt_data[sizeof(paint_file_header_t) + SAMPLE_PNT_W * SAMPLE_PNT_H];
+    paint_file_header_t header;
+    header.magic = PAINT_FILE_MAGIC;
+    header.version = PAINT_FILE_VERSION;
+    header.width = SAMPLE_PNT_W;
+    header.height = SAMPLE_PNT_H;
+    header.reserved = 0;
+    memcpy(pnt_data, &header, sizeof(header));
+    uint8_t *pnt_pix = pnt_data + sizeof(header);
+    for (int y = 0; y < SAMPLE_PNT_H; y++) {
+        for (int x = 0; x < SAMPLE_PNT_W; x++) {
+            uint8_t color = (uint8_t)((x / 2 + y / 2) % 8);
+            *pnt_pix++ = color;
+        }
+    }
+    sample_write_file("/samples/sample.pnt", pnt_data, sizeof(pnt_data));
+}
 
 extern const uint8_t _binary_hello_elf_start[];
 extern const uint8_t _binary_hello_elf_end[];
@@ -112,6 +210,8 @@ extern const uint8_t _binary_beep_elf_start[];
 extern const uint8_t _binary_beep_elf_end[];
 extern const uint8_t _binary_soundtest_elf_start[];
 extern const uint8_t _binary_soundtest_elf_end[];
+extern const uint8_t _binary_mixer_elf_start[];
+extern const uint8_t _binary_mixer_elf_end[];
 extern const uint8_t _binary_halt_elf_start[];
 extern const uint8_t _binary_halt_elf_end[];
 extern const uint8_t _binary_run_elf_start[];
@@ -240,6 +340,7 @@ static const embedded_program_t embedded_programs[] = {
     {"/bin/theme.elf", _binary_theme_elf_start, _binary_theme_elf_end},
     {"/bin/beep.elf", _binary_beep_elf_start, _binary_beep_elf_end},
     {"/bin/soundtest.elf", _binary_soundtest_elf_start, _binary_soundtest_elf_end},
+    {"/bin/mixer.elf", _binary_mixer_elf_start, _binary_mixer_elf_end},
     {"/bin/halt.elf", _binary_halt_elf_start, _binary_halt_elf_end},
     {"/bin/run.elf", _binary_run_elf_start, _binary_run_elf_end},
     {"/bin/rmdir.elf", _binary_rmdir_elf_start, _binary_rmdir_elf_end},
@@ -337,6 +438,102 @@ static inline bool are_interrupts_enabled()
     return flags & (1 << 9);
 }
 
+static bool dma_boot_override = false;
+
+static char tolower_ascii(char c) {
+	if (c >= 'A' && c <= 'Z') {
+		return (char)(c + ('a' - 'A'));
+	}
+	return c;
+}
+
+static bool has_prefix(const char *str, const char *prefix) {
+	size_t i = 0;
+	for (; prefix[i] != '\0'; i++) {
+		if (str[i] == '\0' || str[i] != prefix[i]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool parse_dma_setting(const char *buf, bool *enabled_out) {
+	const char *p = buf;
+	while (p && *p) {
+		while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+			p++;
+		}
+		if (has_prefix(p, "dma=")) {
+			p += 4;
+			char value[8];
+			size_t idx = 0;
+			while (*p && *p != '\n' && *p != '\r' && *p != ' ' && idx + 1 < sizeof(value)) {
+				value[idx++] = tolower_ascii(*p++);
+			}
+			value[idx] = '\0';
+			if (strcmp(value, "on") == 0 || strcmp(value, "1") == 0 || strcmp(value, "true") == 0) {
+				*enabled_out = true;
+				return true;
+			}
+			if (strcmp(value, "off") == 0 || strcmp(value, "0") == 0 || strcmp(value, "false") == 0) {
+				*enabled_out = false;
+				return true;
+			}
+		}
+		while (*p && *p != '\n') {
+			p++;
+		}
+		if (*p == '\n') {
+			p++;
+		}
+	}
+	return false;
+}
+
+static void boot_apply_dma_config(void) {
+	if (dma_boot_override) {
+		return;
+	}
+	fs_context_t *fs = fs_get_context();
+	if (!fs || !fs->mounted) {
+		return;
+	}
+	char buffer[128];
+	int read = fs_read_file("/etc/boot.cfg", (uint8_t *)buffer, sizeof(buffer) - 1, 0);
+	if (read <= 0) {
+		return;
+	}
+	buffer[read] = '\0';
+	bool enabled = false;
+	if (parse_dma_setting(buffer, &enabled)) {
+		ata_set_dma_enabled(enabled);
+		printf("ATA DMA %s (from /etc/boot.cfg)\n", enabled ? "enabled" : "disabled");
+	}
+}
+
+static void boot_dma_toggle_prompt(void) {
+    const int timeout_ms = 1500;
+    printf("Boot option: press 'D' to toggle ATA DMA (currently %s)...\n",
+           ata_dma_is_enabled() ? "on" : "off");
+    keyboard_clear_buffer();
+    int remaining = timeout_ms;
+    while (remaining > 0) {
+        if (keyboard_has_input()) {
+            unsigned char c = keyboard_getchar();
+            if (c == 'd' || c == 'D') {
+                bool enabled = !ata_dma_is_enabled();
+                ata_set_dma_enabled(enabled);
+                dma_boot_override = true;
+                printf("ATA DMA %s (will validate on init)\n",
+                       enabled ? "enabled" : "disabled");
+            }
+            break;
+        }
+        timer_sleep_ms(10);
+        remaining -= 10;
+    }
+}
+
 void kernel_main(void) {   
 	__asm__ volatile ("cli"); // Keep interrupts off until IDT is installed.
 
@@ -353,12 +550,10 @@ void kernel_main(void) {
     
 	idt_init();
     timer_init(100); // Initialize timer at 100 Hz (10ms per tick)
-    scheduler_init(); // Initialize task scheduler
+    task_scheduler_init(); // Initialize kernel task scheduler
     keyboard_init();
     mouse_init();
     graphics_init();
-    ata_init();
-    fs_init();
 	idt_init();
 	pic_disable();
 	__asm__ volatile ("sti");
@@ -366,6 +561,11 @@ void kernel_main(void) {
 	IRQ_clear_mask(1);  // Keyboard
 	IRQ_clear_mask(2);  // Cascade (needed for IRQ12)
 	IRQ_clear_mask(12); // Mouse
+    boot_dma_toggle_prompt();
+    ata_init();
+    fs_init();
+	net_init();
+	audio_init();
 
     
 
@@ -386,6 +586,7 @@ void kernel_main(void) {
             if (fs_format(0)) {
                 if (fs_mount(0)) {
                     printf("Disk formatted and mounted successfully!\n");
+                    boot_apply_dma_config();
                     
                     // Create a welcome file
                     fs_create_file("welcome.txt");
@@ -393,6 +594,7 @@ void kernel_main(void) {
                     fs_write_file("welcome.txt", (const uint8_t*)welcome, strlen(welcome), 0);
 
                     fs_create_dir("/bin");
+                    create_sample_images();
                 } else {
                     printf("Failed to mount after format\n");
                 }
@@ -401,7 +603,9 @@ void kernel_main(void) {
             }
         } else {
             printf("Disk mounted successfully!\n");
+            boot_apply_dma_config();
             fs_create_dir("/bin");
+            create_sample_images();
         }
     } else {
         printf("Warning: No disk drive detected. File operations will be limited.\n");

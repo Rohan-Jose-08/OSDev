@@ -23,6 +23,7 @@ extern keyboard_handler
 extern mouse_handler
 extern timer_handler
 extern PIC_sendEOI
+extern irq_dispatch
 extern kpti_prepare_return_trap
 extern trampoline_irq_return
 
@@ -124,7 +125,7 @@ irq_stub_table:
 %if i != 0 && i != 1 && i != 12
 irq_handler_%+i:
     push i
-    call PIC_sendEOI
+    call irq_dispatch
     add esp, 4
     ret
 %endif

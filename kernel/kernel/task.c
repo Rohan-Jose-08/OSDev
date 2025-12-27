@@ -10,7 +10,7 @@ static task_t tasks[MAX_TASKS];
 static task_t *current_task = NULL;
 static task_t *ready_queue_head = NULL;
 static uint32_t next_task_id = 1;
-static bool scheduler_enabled = false;
+static bool task_scheduler_enabled = false;
 
 // Timer tick counter
 static uint32_t system_ticks = 0;
@@ -162,8 +162,8 @@ static task_t* allocate_task(void) {
     return NULL;
 }
 
-// Initialize the scheduler
-void scheduler_init(void) {
+// Initialize the kernel task scheduler
+void task_scheduler_init(void) {
     // Initialize all tasks
     for (int i = 0; i < MAX_TASKS; i++) {
         tasks[i].id = 0;
@@ -182,12 +182,12 @@ void scheduler_init(void) {
     // Create idle task (task ID 0 - runs when nothing else can run)
     // For now, we'll handle this implicitly
     
-    scheduler_enabled = true;
+    task_scheduler_enabled = true;
 }
 
 // Create a new task
 task_t* task_create(const char *name, void (*entry_point)(void), uint32_t priority) {
-    if (!scheduler_enabled) {
+    if (!task_scheduler_enabled) {
         return NULL;
     }
     
@@ -232,7 +232,7 @@ task_t* task_create(const char *name, void (*entry_point)(void), uint32_t priori
     // Add to ready queue
     enqueue_task(task);
     
-    printf("Task %u '%s' created (priority %u)\n", task->id, task->name, task->priority);
+    printf("KThread %u '%s' created (priority %u)\n", task->id, task->name, task->priority);
     
     return task;
 }
@@ -258,7 +258,7 @@ void task_exit(void) {
         return;
     }
     
-    printf("Task %u '%s' terminated\n", current_task->id, current_task->name);
+    printf("KThread %u '%s' terminated\n", current_task->id, current_task->name);
     
     current_task->state = TASK_TERMINATED;
     current_task->sleeping = false;
@@ -271,7 +271,7 @@ void task_exit(void) {
 
 // Yield CPU to another task
 void task_yield(void) {
-    if (!scheduler_enabled) {
+    if (!task_scheduler_enabled) {
         return;
     }
 
@@ -364,14 +364,14 @@ void task_sleep(uint32_t ticks) {
 }
 
 // Scheduler tick (called by timer interrupt)
-void scheduler_tick(void) {
+void task_scheduler_tick(void) {
     system_ticks++;
     
-    if (scheduler_enabled) {
+    if (task_scheduler_enabled) {
         wake_sleeping_tasks(system_ticks);
     }
 
-    if (!scheduler_enabled || !current_task) {
+    if (!task_scheduler_enabled || !current_task) {
         return;
     }
     
@@ -391,7 +391,7 @@ void scheduler_tick(void) {
 
 // List all tasks
 void task_list(void) {
-    printf("PID\tState\t\tPriority  Time\tName\n");
+    printf("TID\tState\t\tPriority  Time\tName\n");
     printf("---\t--------\t--------  ----\t--------------------------------\n");
     
     for (int i = 0; i < MAX_TASKS; i++) {
@@ -425,7 +425,7 @@ bool task_kill(uint32_t id) {
         task->sleeping = false;
         task->sleep_until = 0;
         free_kernel_stack(task->kernel_stack);
-        printf("Task %u '%s' killed\n", task->id, task->name);
+        printf("KThread %u '%s' killed\n", task->id, task->name);
     }
     
     return true;

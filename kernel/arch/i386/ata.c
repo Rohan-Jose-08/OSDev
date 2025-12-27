@@ -1,5 +1,7 @@
 #include <kernel/ata.h>
 #include <kernel/io.h>
+#include <kernel/memory.h>
+#include <kernel/pci.h>
 #include <kernel/tty.h>
 #include <string.h>
 #include <stdio.h>
@@ -13,6 +15,15 @@ static prdt_entry_t prdt[16] __attribute__((aligned(4)));
 // Bus Master IDE base addresses (will be detected or use defaults)
 static uint16_t primary_bmide = 0;
 static uint16_t secondary_bmide = 0;
+#ifndef ATA_ENABLE_DMA
+#define ATA_ENABLE_DMA 0
+#endif
+#ifndef ATA_DMA_VERIFY
+#define ATA_DMA_VERIFY 1
+#endif
+static bool ata_dma_enabled = (ATA_ENABLE_DMA != 0);
+static bool ata_dma_verified = false;
+static uint8_t dma_verify_buffer[ATA_SECTOR_SIZE];
 
 // Read ATA register
 static inline uint8_t ata_read_reg(uint16_t base, uint8_t reg) {
@@ -65,7 +76,7 @@ static bool ata_setup_dma(uint16_t bmide, const uint8_t *buffer, uint32_t byte_c
     while (remaining > 0 && prdt_entries < 16) {
         uint32_t chunk_size = (remaining > 65536) ? 65536 : remaining;
         
-        prdt[prdt_entries].buffer_phys = (uint32_t)(buffer + offset);
+        prdt[prdt_entries].buffer_phys = virt_to_phys(buffer + offset);
         prdt[prdt_entries].byte_count = (chunk_size == 65536) ? 0 : chunk_size;  // 0 means 64KB
         prdt[prdt_entries].reserved = (remaining <= chunk_size) ? 0x8000 : 0;  // Set EOT on last entry
         
@@ -78,7 +89,7 @@ static bool ata_setup_dma(uint16_t bmide, const uint8_t *buffer, uint32_t byte_c
     outb(bmide + BM_COMMAND_REG, 0);
     
     // Set PRDT address
-    outl(bmide + BM_PRDT_REG, (uint32_t)prdt);
+    outl(bmide + BM_PRDT_REG, virt_to_phys(prdt));
     
     // Clear error and interrupt flags
     uint8_t status = inb(bmide + BM_STATUS_REG);
@@ -99,33 +110,51 @@ static void ata_start_dma(uint16_t bmide) {
 
 // Wait for DMA completion
 static bool ata_wait_dma(uint16_t bmide, uint16_t ata_base) {
-    // Wait for DMA to complete
+    // Wait for DMA completion IRQ or drive becoming idle.
     for (int i = 0; i < 100000; i++) {
         uint8_t bm_status = inb(bmide + BM_STATUS_REG);
         uint8_t ata_status = ata_read_reg(ata_base, ATA_REG_STATUS);
-        
-        // Check if DMA is still active
-        uint8_t cmd = inb(bmide + BM_COMMAND_REG);
-        if (!(cmd & BM_CMD_START)) {
-            // DMA stopped - check for errors
-            if (bm_status & BM_STATUS_ERROR) {
-                outb(bmide + BM_COMMAND_REG, 0);
-                return false;
-            }
-            if (ata_status & ATA_SR_ERR) {
-                outb(bmide + BM_COMMAND_REG, 0);
+
+        if (bm_status & BM_STATUS_IRQ) {
+            outb(bmide + BM_COMMAND_REG, 0);
+            outb(bmide + BM_STATUS_REG, bm_status | BM_STATUS_ERROR | BM_STATUS_IRQ);
+
+            if ((bm_status & BM_STATUS_ERROR) || (ata_status & ATA_SR_ERR)) {
                 return false;
             }
             if (!(ata_status & ATA_SR_BSY)) {
-                outb(bmide + BM_COMMAND_REG, 0);
                 return true;
             }
+        } else if (!(ata_status & ATA_SR_BSY) && (ata_status & ATA_SR_DRDY)) {
+            // Some controllers don't assert IRQ in polling mode.
+            outb(bmide + BM_COMMAND_REG, 0);
+            outb(bmide + BM_STATUS_REG, bm_status | BM_STATUS_ERROR | BM_STATUS_IRQ);
+            if (ata_status & ATA_SR_ERR) {
+                return false;
+            }
+            return true;
         }
     }
-    
+
     // Timeout - stop DMA
     outb(bmide + BM_COMMAND_REG, 0);
     return false;
+}
+
+void ata_set_dma_enabled(bool enabled) {
+    ata_dma_enabled = enabled;
+    ata_dma_verified = false;
+}
+
+bool ata_dma_is_enabled(void) {
+    return ata_dma_enabled;
+}
+
+static bool ata_verify_dma_write(uint8_t drive, uint32_t lba, const uint8_t *buffer) {
+    if (!ata_read_sectors(drive, lba, 1, dma_verify_buffer)) {
+        return false;
+    }
+    return memcmp(dma_verify_buffer, buffer, ATA_SECTOR_SIZE) == 0;
 }
 
 // Identify ATA device
@@ -187,9 +216,12 @@ static bool ata_identify(uint16_t base, uint8_t drive_sel, ata_device_t *device)
         }
     }
     
+    // Capabilities (word 49)
+    device->dma_supported = (identify_data[49] & (1 << 8)) != 0;
+
     // Get size in sectors (words 60-61 for 28-bit LBA)
     device->size_sectors = (uint32_t)identify_data[60] | ((uint32_t)identify_data[61] << 16);
-    
+
     return true;
 }
 
@@ -198,23 +230,55 @@ void ata_init(void) {
     printf("ATA: Initializing IDE/ATA driver...\n");
     
     memset(ata_devices, 0, sizeof(ata_devices));
-    
-    // Try to detect Bus Master IDE address from common locations
-    // Most systems use 0xC000-0xC00F for primary/secondary BMIDE
-    // Try reading the status register - if it returns sensible values, we found it
-    for (uint16_t test_addr = 0xC000; test_addr < 0xD000; test_addr += 0x10) {
-        uint8_t status = inb(test_addr + BM_STATUS_REG);
-        // Valid status should have some bits but not all FFs
-        if (status != 0xFF && status != 0x00) {
-            primary_bmide = test_addr;
-            secondary_bmide = test_addr + 8;
-            printf("ATA: Detected Bus Master IDE at 0x%x\n", test_addr);
-            break;
+
+    bool bmide_found = false;
+    pci_device_t ide_dev;
+    if (pci_find_class(0x01, 0x01, 0xFF, &ide_dev)) {
+        pci_enable_bus_master(&ide_dev);
+        uint32_t bmide_bar = ide_dev.bar[4];
+        uint16_t bmide_base = 0;
+        if (bmide_bar & 0x1) {
+            bmide_base = (uint16_t)(bmide_bar & ~0x3);
+        }
+        if (bmide_base == 0) {
+            uint32_t alt_bar = ide_dev.bar[5];
+            if (alt_bar & 0x1) {
+                bmide_base = (uint16_t)(alt_bar & ~0x3);
+            }
+        }
+        if (bmide_base != 0) {
+            primary_bmide = bmide_base;
+            secondary_bmide = (uint16_t)(bmide_base + 8);
+            bmide_found = true;
+            printf("ATA: PCI IDE BMIDE at 0x%x (bus %u slot %u func %u)\n",
+                   bmide_base, ide_dev.bus, ide_dev.slot, ide_dev.func);
+        }
+    }
+
+    if (!bmide_found) {
+        // Try to detect Bus Master IDE address from common locations
+        // Most systems use 0xC000-0xC00F for primary/secondary BMIDE
+        // Try reading the status register - if it returns sensible values, we found it
+        for (uint16_t test_addr = 0xC000; test_addr < 0xD000; test_addr += 0x10) {
+            uint8_t status = inb(test_addr + BM_STATUS_REG);
+            // Valid status should have some bits but not all FFs
+            if (status != 0xFF && status != 0x00) {
+                primary_bmide = test_addr;
+                secondary_bmide = test_addr + 8;
+                printf("ATA: Detected Bus Master IDE at 0x%x\n", test_addr);
+                bmide_found = true;
+                break;
+            }
         }
     }
     
     if (primary_bmide == 0) {
         printf("ATA: Bus Master IDE not detected, DMA disabled\n");
+        ata_dma_enabled = false;
+    } else if (!ata_dma_enabled) {
+        printf("ATA: DMA disabled, using PIO\n");
+    } else {
+        printf("ATA: DMA enabled\n");
     }
     
     // Check primary master
@@ -334,7 +398,7 @@ bool ata_write_sectors(uint8_t drive, uint32_t lba, uint8_t sector_count, const 
     uint16_t bmide = device->bmide;
     
     // Try DMA if available
-    if (bmide != 0 && sector_count <= 128) {
+    if (ata_dma_enabled && device->dma_supported && bmide != 0 && sector_count <= 128) {
         uint32_t byte_count = sector_count * ATA_SECTOR_SIZE;
         
         // Copy to aligned DMA buffer
@@ -368,11 +432,22 @@ bool ata_write_sectors(uint8_t drive, uint32_t lba, uint8_t sector_count, const 
             
             // Wait for completion
             if (ata_wait_dma(bmide, base)) {
+#if ATA_DMA_VERIFY
+                if (!ata_dma_verified) {
+                    if (!ata_verify_dma_write(drive, lba, buffer)) {
+                        printf("ATA: DMA verify failed, disabling DMA\n");
+                        ata_dma_enabled = false;
+                        goto fallback_pio;
+                    }
+                    ata_dma_verified = true;
+                }
+#endif
                 return true;
             }
-            
-            // DMA failed, fall back to PIO
+
+            // DMA failed, fall back to PIO and disable DMA
             printf("ATA: DMA failed, falling back to PIO\n");
+            ata_dma_enabled = false;
         }
     }
     

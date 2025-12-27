@@ -15,7 +15,7 @@ USER_CFLAGS?=-ffreestanding -fno-pic -fno-stack-protector -fno-builtin -nostdlib
 USER_CFLAGS+=-I$(INCLUDE_DIR)
 USER_LDFLAGS?=-nostdlib -Wl,-T,linker.ld -Wl,-N
 
-APPS=hello cat execdemo statdemo ls rm mkdir touch pwd echo reverse strlen upper lower calc draw banner clear color colors write history cd help about sysinfo uptime randcolor rainbow art fortune animate matrix guess rps tictactoe hangman timer alias unalias aliases theme beep soundtest halt run rmdir gfx gfxanim gfxpaint gui guipaint guicalc guifilemgr desktop forktest schedtest fault abi_test
+APPS=hello cat execdemo statdemo ls rm mkdir touch pwd echo reverse strlen upper lower calc draw banner clear color colors write history cd help about sysinfo uptime randcolor rainbow art fortune animate matrix guess rps tictactoe hangman timer alias unalias aliases theme beep soundtest mixer halt run rmdir gfx gfxanim gfxpaint gui guipaint guicalc guifilemgr desktop forktest schedtest fault abi_test
 APP_ELF=$(addsuffix .elf,$(APPS))
 APP_BLOB=$(addsuffix _blob.o,$(APPS))
 APP_OBJS=$(addprefix $(BUILD_DIR)/,$(addsuffix .o,$(APPS)))
@@ -40,6 +40,12 @@ $(BUILD_DIR)/file_manager.o \
 $(BUILD_DIR)/editor.o \
 $(BUILD_DIR)/file_dialog.o \
 $(BUILD_DIR)/gui_apps.o \
+$(BUILD_DIR)/terminal.o \
+$(BUILD_DIR)/image_viewer.o \
+$(BUILD_DIR)/music_player.o \
+$(BUILD_DIR)/system_monitor.o \
+$(BUILD_DIR)/process_viewer.o \
+$(BUILD_DIR)/package_manager.o \
 
 LIBU_OBJS=$(LIBC_OBJS) $(LIBGUI_OBJS)
 

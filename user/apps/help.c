@@ -23,7 +23,7 @@ int main(void) {
 	write_line("  alias, unalias, aliases, theme, history, timer\n\n");
 
 	write_line("System:\n");
-	write_line("  sysinfo, uptime, beep [frequency_hz] [duration_ms], soundtest, halt, run\n\n");
+	write_line("  sysinfo, uptime, beep [frequency_hz] [duration_ms], soundtest, mixer, halt, run\n\n");
 
 	write_line("Graphics/GUI:\n");
 	write_line("  gfx, gfxanim, gfxpaint, gui, guipaint, guicalc, guifilemgr, desktop\n\n");

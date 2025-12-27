@@ -14,8 +14,21 @@ int main(void) {
 
 	char *text = skip_spaces(args);
 	if (!*text) {
-		write("Usage: lower <text>\n", sizeof("Usage: lower <text>\n") - 1);
-		return 1;
+		char buf[128];
+		for (;;) {
+			int n = read(0, buf, sizeof(buf));
+			if (n <= 0) {
+				break;
+			}
+			for (int i = 0; i < n; i++) {
+				char c = buf[i];
+				if (c >= 'A' && c <= 'Z') {
+					buf[i] = (char)(c + 32);
+				}
+			}
+			write(buf, (uint32_t)n);
+		}
+		return 0;
 	}
 
 	while (*text) {

@@ -67,5 +67,29 @@ int main(void) {
 	print_uint(info.st_size);
 	puts(" bytes");
 
+	write("Perm: ", 6);
+	print_uint(info.st_perm);
+	puts("");
+
+	write("UID: ", 5);
+	print_uint(info.st_uid);
+	puts("");
+
+	write("GID: ", 5);
+	print_uint(info.st_gid);
+	puts("");
+
+	write("Atime: ", 7);
+	print_uint(info.st_atime);
+	puts("");
+
+	write("Mtime: ", 7);
+	print_uint(info.st_mtime);
+	puts("");
+
+	write("Ctime: ", 7);
+	print_uint(info.st_ctime);
+	puts("");
+
 	return 0;
 }

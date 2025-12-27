@@ -10,6 +10,8 @@ typedef void (*window_draw_fn)(window_t*);
 typedef void (*window_mouse_fn)(window_t*, int, int, int);
 typedef void (*window_scroll_fn)(window_t*, int);
 typedef void (*window_key_fn)(window_t*, int);
+typedef void (*window_tick_fn)(window_t*, uint32_t);
+typedef void (*window_close_fn)(window_t*);
 
 int window_content_width(window_t* win);
 int window_content_height(window_t* win);
@@ -51,6 +53,14 @@ static inline void window_set_handlers(window_t* win,
                                        window_key_fn key_fn,
                                        void* user_data) {
 	uwm_window_set_handlers(win, draw_fn, down_fn, up_fn, move_fn, scroll_fn, key_fn, user_data);
+}
+
+static inline void window_set_tick_handler(window_t* win, window_tick_fn tick_fn) {
+	uwm_window_set_tick_handler(win, tick_fn);
+}
+
+static inline void window_set_close_handler(window_t* win, window_close_fn close_fn) {
+	uwm_window_set_close_handler(win, close_fn);
 }
 
 #endif

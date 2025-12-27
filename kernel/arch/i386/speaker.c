@@ -1,3 +1,4 @@
+#include <kernel/audio.h>
 #include <kernel/io.h>
 #include <kernel/speaker.h>
 #include <kernel/timer.h>
@@ -30,6 +31,10 @@ static uint32_t clamp_frequency(uint32_t frequency_hz) {
 
 void speaker_start(uint32_t frequency_hz) {
 	uint32_t frequency = clamp_frequency(frequency_hz);
+	if (audio_is_ready()) {
+		audio_tone_start(frequency);
+		return;
+	}
 	uint32_t divisor = PIT_FREQUENCY / frequency;
 	uint8_t speaker_state;
 
@@ -46,6 +51,9 @@ void speaker_start(uint32_t frequency_hz) {
 }
 
 void speaker_stop(void) {
+	if (audio_is_ready()) {
+		audio_tone_stop();
+	}
 	uint8_t speaker_state = inb(SPEAKER_PORT);
 	outb(SPEAKER_PORT, speaker_state & 0xFC);
 }

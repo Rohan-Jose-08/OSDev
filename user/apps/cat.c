@@ -27,8 +27,15 @@ int main(void) {
 	uint32_t total = getargs(args, sizeof(args));
 
 	if (total == 0) {
-		puts("Usage: cat [-o offset] <file>");
-		return 1;
+		char buf[128];
+		for (;;) {
+			int n = read(0, buf, sizeof(buf));
+			if (n <= 0) {
+				break;
+			}
+			write(buf, (uint32_t)n);
+		}
+		return 0;
 	}
 
 	if (total >= sizeof(args)) {
